@@ -62,9 +62,7 @@ function createProvider(name: string, config: ResolvedVaultConfig) {
         console.error(`Error: vault "${name}" is type 1password but service account token is not set`);
         process.exit(1);
       }
-      // Set the token for the 1Password SDK (it reads from env)
-      process.env.OP_SERVICE_ACCOUNT_TOKEN = config.serviceAccountToken;
-      return new OnePasswordProvider(config.vaultIds || [], config.write);
+      return new OnePasswordProvider(config.serviceAccountToken, config.vaultIds || [], config.write);
     }
     default:
       console.error(`Unknown provider type "${config.type}" for vault "${name}"`);

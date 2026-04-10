@@ -14,12 +14,15 @@ export class OnePasswordProvider implements SecretProvider {
   private client: any = null;
   private vaultIds: string[];
   private writeConfig?: { vaultId: string; category: string };
+  private authToken: string;
 
   /**
+   * @param authToken - 1Password service account token for authentication.
    * @param vaultIds - Optional list of vault IDs to expose. If empty, all accessible vaults are listed.
    * @param writeConfig - Optional write config specifying which vault and category to create items in.
    */
-  constructor(vaultIds: string[] = [], writeConfig?: { vaultId: string; category: string }) {
+  constructor(authToken: string, vaultIds: string[] = [], writeConfig?: { vaultId: string; category: string }) {
+    this.authToken = authToken;
     this.vaultIds = vaultIds;
     this.writeConfig = writeConfig;
   }
@@ -30,7 +33,7 @@ export class OnePasswordProvider implements SecretProvider {
     // @ts-ignore - optional peer dependency
     const { createClient } = await import("@1password/sdk");
     this.client = await createClient({
-      auth: process.env.OP_SERVICE_ACCOUNT_TOKEN!,
+      auth: this.authToken,
       integrationName: "agent-vault",
       integrationVersion: "0.1.0",
     });
