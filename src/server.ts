@@ -232,7 +232,12 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
         return errorResponse(`Write of "${name}" to vault "${vaultName}" was DENIED.`);
       }
 
-      await vault.provider.setSecret(name, value);
+      try {
+        await vault.provider.setSecret(name, value);
+      } catch (err: any) {
+        audit.log(`${vaultName}/${name}`, reason, "denied", "secret");
+        return errorResponse(`Failed to write "${name}" to vault "${vaultName}": ${err.message}`);
+      }
       audit.log(`${vaultName}/${name}`, reason, "approved", "secret");
       webhooks.dispatch(writeEvent(vaultName, [name], reason, "approved"));
 
@@ -290,9 +295,20 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
         return errorResponse(`Write of ${secrets.length} secret(s) to vault "${vaultName}" was DENIED.`);
       }
 
+      const saved: string[] = [];
       for (const secret of secrets) {
-        await vault.provider.setSecret!(secret.name, secret.value);
-        audit.log(`${vaultName}/${secret.name}`, reason, "approved", "secret");
+        try {
+          await vault.provider.setSecret!(secret.name, secret.value);
+          audit.log(`${vaultName}/${secret.name}`, reason, "approved", "secret");
+          saved.push(secret.name);
+        } catch (err: any) {
+          audit.log(`${vaultName}/${secret.name}`, reason, "denied", "secret");
+          webhooks.dispatch(writeEvent(vaultName, saved, reason, "approved"));
+          return errorResponse(
+            `Failed to write "${secret.name}" to vault "${vaultName}": ${err.message}` +
+            (saved.length ? ` (${saved.length} secret(s) saved before failure: ${saved.join(", ")})` : "")
+          );
+        }
       }
       webhooks.dispatch(writeEvent(vaultName, names, reason, "approved"));
 

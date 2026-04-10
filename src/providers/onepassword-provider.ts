@@ -125,31 +125,49 @@ export class OnePasswordProvider implements SecretProvider {
       // Vault may not be listable — proceed to create
     }
 
-    if (existingItem) {
-      // Update existing item — fetch full item, update the password/value field
-      const fullItem = await client.items.get(vaultId, existingItem.id);
-      for (const field of fullItem.fields) {
-        if (field.fieldType === "Concealed" || field.id === "password") {
-          field.value = value;
-          break;
+    try {
+      if (existingItem) {
+        // Update existing item — fetch full item, update the password/value field
+        const fullItem = await client.items.get(vaultId, existingItem.id);
+        for (const field of fullItem.fields) {
+          if (field.fieldType === "Concealed" || field.id === "password") {
+            field.value = value;
+            break;
+          }
         }
+        await client.items.put(fullItem);
+      } else {
+        // Create new item
+        await client.items.create({
+          vaultId,
+          title: id,
+          category,
+          fields: [
+            {
+              id: "password",
+              title: "password",
+              fieldType: "Concealed",
+              value,
+            },
+          ],
+        });
       }
-      await client.items.put(fullItem);
-    } else {
-      // Create new item
-      await client.items.create({
-        vaultId,
-        title: id,
-        category,
-        fields: [
-          {
-            id: "password",
-            title: "password",
-            fieldType: "Concealed",
-            value,
-          },
-        ],
-      });
+    } catch (err: any) {
+      const msg = err?.message ?? String(err);
+      if (
+        msg.includes("unsupported item category") ||
+        msg.includes("permission") ||
+        msg.includes("access denied") ||
+        msg.includes("unauthorized") ||
+        msg.includes("doesn't have access")
+      ) {
+        throw new Error(
+          `1Password service account does not have write permission for this vault. ` +
+          `Update your service account in 1Password to grant write access to the target vault, ` +
+          `then restart agent-vault. (Original error: ${msg})`
+        );
+      }
+      throw err;
     }
   }
 }
