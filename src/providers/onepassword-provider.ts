@@ -43,16 +43,13 @@ export class OnePasswordProvider implements SecretProvider {
 
     let vaultIds = this.vaultIds;
     if (vaultIds.length === 0) {
-      const vaults = await client.vaults.listAll();
-      vaultIds = [];
-      for await (const vault of vaults) {
-        vaultIds.push(vault.id);
-      }
+      const vaults = await client.vaults.list();
+      vaultIds = vaults.map((v: any) => v.id);
     }
 
     for (const vaultId of vaultIds) {
-      const items = await client.items.listAll(vaultId);
-      for await (const item of items) {
+      const items = await client.items.list(vaultId);
+      for (const item of items) {
         entries.push({
           id: `op://${vaultId}/${item.id}`,
           name: item.title,
@@ -67,14 +64,37 @@ export class OnePasswordProvider implements SecretProvider {
   async getSecret(id: string): Promise<string> {
     const client = await this.getClient();
 
-    // If it's already an op:// reference, resolve directly
+    // If it's an op:// reference, resolve directly
     if (id.startsWith("op://")) {
       return client.secrets.resolve(id);
     }
 
-    // Otherwise treat it as a raw item reference — caller should use op:// format
+    // Otherwise look up item by title across configured vaults
+    let vaultIds = this.vaultIds;
+    if (vaultIds.length === 0) {
+      const vaults = await client.vaults.list();
+      vaultIds = vaults.map((v: any) => v.id);
+    }
+
+    for (const vaultId of vaultIds) {
+      const items = await client.items.list(vaultId);
+      const match = items.find((item: any) => item.title === id);
+      if (match) {
+        const fullItem = await client.items.get(vaultId, match.id);
+        // Return all fields as JSON
+        const fields: Record<string, string> = {};
+        for (const field of fullItem.fields) {
+          const key = field.title || field.fieldType || "value";
+          if (field.value) {
+            fields[key] = field.value;
+          }
+        }
+        return JSON.stringify(fields);
+      }
+    }
+
     throw new Error(
-      `Invalid secret reference "${id}". Use op://vault/item/field format.`
+      `Secret "${id}" not found. Use the exact item title from list_secrets, or an op://vault/item/field reference.`
     );
   }
 
@@ -91,8 +111,8 @@ export class OnePasswordProvider implements SecretProvider {
     // Check if item already exists by searching for it
     let existingItem: any = null;
     try {
-      const items = await client.items.listAll(vaultId);
-      for await (const item of items) {
+      const items = await client.items.list(vaultId);
+      for (const item of items) {
         if (item.title === id) {
           existingItem = item;
           break;

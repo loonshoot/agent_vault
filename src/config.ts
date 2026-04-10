@@ -98,20 +98,18 @@ function resolveEnvRef(value: string | undefined): string | undefined {
  * 2. Current working directory
  * 3. Home directory (~/.agent-vault.config.json)
  *
- * If no config file is found, falls back to legacy env var configuration
- * with a single vault.
+ * If no config file is found, exits with an error.
  */
 export function loadConfig(): ResolvedConfig {
   const configPath = findConfigFile();
 
-  if (configPath) {
-    console.error(`Loading config from ${configPath}`);
-    return parseConfigFile(configPath);
+  if (!configPath) {
+    console.error("Error: no config file found. Create agent-vault.config.json or set AGENT_VAULT_CONFIG env var.");
+    process.exit(1);
   }
 
-  // Legacy fallback: build config from env vars (single vault)
-  console.error("No config file found — using environment variables (legacy mode)");
-  return buildLegacyConfig();
+  console.error(`Loading config from ${configPath}`);
+  return parseConfigFile(configPath);
 }
 
 function findConfigFile(): string | null {
@@ -184,35 +182,3 @@ function parseConfigFile(configPath: string): ResolvedConfig {
   };
 }
 
-function buildLegacyConfig(): ResolvedConfig {
-  const providerType = process.env.AGENT_VAULT_PROVIDER || "env";
-  const ttl = parseInt(process.env.AGENT_VAULT_TTL_MINUTES || "0", 10);
-
-  const vaults: Record<string, ResolvedVaultConfig> = {};
-
-  if (providerType === "1password") {
-    vaults["default"] = {
-      type: "1password",
-      ttl,
-      ttlScope: "secret",
-      writable: false,
-      serviceAccountToken: process.env.OP_SERVICE_ACCOUNT_TOKEN,
-      vaultIds: process.env.AGENT_VAULT_1P_VAULTS?.split(",").filter(Boolean),
-    };
-  } else {
-    vaults["default"] = {
-      type: "env",
-      ttl,
-      ttlScope: "secret",
-      writable: false,
-      file: resolve(process.env.AGENT_VAULT_ENV_FILE || ".env.secrets"),
-    };
-  }
-
-  return {
-    vaults,
-    ngrokAuthToken: process.env.NGROK_AUTHTOKEN,
-    port: parseInt(process.env.AGENT_VAULT_PORT || "9999", 10),
-    webhooks: [],
-  };
-}

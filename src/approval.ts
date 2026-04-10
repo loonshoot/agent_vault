@@ -26,6 +26,34 @@ export class ApprovalServer {
   }
 
   private setupRoutes() {
+    // Dashboard showing all pending approval requests
+    this.app.get("/", (req, res) => {
+      if (this.pending.size === 0) {
+        res.send(this.renderPage("Agent Vault", "<p>No pending approval requests.</p>"));
+        return;
+      }
+      const items = Array.from(this.pending.values())
+        .map((r) => {
+          const badge = r.action === "write"
+            ? `<span class="badge write">WRITE</span>`
+            : `<span class="badge read">READ</span>`;
+          return `<div class="request-info" style="margin-bottom:16px;padding:12px;border:1px solid #333;border-radius:8px">
+            <p>${badge} <strong>${escapeHtml(r.secretName)}</strong></p>
+            <p style="font-size:13px;color:#999">${escapeHtml(r.reason)}</p>
+            <div class="actions" style="margin-top:8px">
+              <form method="POST" action="/approve/${r.id}/yes" style="display:inline">
+                <button type="submit" class="btn approve">Approve</button>
+              </form>
+              <form method="POST" action="/approve/${r.id}/no" style="display:inline">
+                <button type="submit" class="btn deny">Deny</button>
+              </form>
+            </div>
+          </div>`;
+        })
+        .join("");
+      res.send(this.renderPage("Pending Approvals", items));
+    });
+
     this.app.get("/approve/:id", (req, res) => {
       const request = this.pending.get(req.params.id);
       if (!request) {
@@ -97,7 +125,9 @@ export class ApprovalServer {
             this.publicUrl = listener.url()!;
             resolve(this.publicUrl);
           } catch (err) {
-            reject(new Error(`Failed to start ngrok tunnel: ${err}`));
+            console.error(`Warning: ngrok failed (${err}) — falling back to localhost`);
+            this.publicUrl = `http://localhost:${this.port}`;
+            resolve(this.publicUrl);
           }
         } else {
           // No ngrok token — fall back to localhost (good for local testing)
