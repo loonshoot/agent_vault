@@ -5,8 +5,8 @@ Thanks for your interest in contributing. Here's what you need to know.
 ## Development setup
 
 ```bash
-git clone https://github.com/yourname/agent-vault.git
-cd agent-vault
+git clone https://github.com/loonshoot/agent_vault.git
+cd agent_vault
 npm install
 ```
 

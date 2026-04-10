@@ -1,0 +1,26 @@
+{
+  "vaults": {
+    "dev": {
+      "type": "1password",
+      "serviceAccountToken": "env:OP_DEV_TOKEN",
+      "vaultIds": ["your-dev-vault-id"],
+      "ttl": 30,
+      "ttlScope": "vault"
+    },
+    "prod": {
+      "type": "1password",
+      "serviceAccountToken": "env:OP_PROD_TOKEN",
+      "vaultIds": ["your-prod-vault-id"],
+      "ttl": 0,
+      "ttlScope": "secret"
+    },
+    "local": {
+      "type": "env",
+      "file": ".env.secrets",
+      "ttl": 15,
+      "ttlScope": "secret"
+    }
+  },
+  "ngrokAuthToken": "env:NGROK_AUTHTOKEN",
+  "port": 9999
+}

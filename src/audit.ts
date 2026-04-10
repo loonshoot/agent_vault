@@ -7,13 +7,15 @@ export interface AuditEntry {
   secretName: string;
   reason: string;
   action: "approved" | "denied" | "auto_approved";
+  scope: "secret" | "vault";
   ttlExpiresAt: string | null;
 }
 
 export class AuditLog {
   private db: Database.Database;
   private insertStmt: Database.Statement;
-  private checkTtlStmt: Database.Statement;
+  private checkSecretTtlStmt: Database.Statement;
+  private checkVaultTtlStmt: Database.Statement;
 
   constructor(dbPath: string = "agent-vault.db") {
     this.db = new Database(resolve(dbPath));
@@ -25,32 +27,61 @@ export class AuditLog {
         secret_name TEXT NOT NULL,
         reason TEXT NOT NULL,
         action TEXT NOT NULL,
+        scope TEXT NOT NULL DEFAULT 'secret',
         ttl_expires_at TEXT
       )
     `);
 
     this.insertStmt = this.db.prepare(
-      `INSERT INTO audit (secret_name, reason, action, ttl_expires_at) VALUES (?, ?, ?, ?)`
+      `INSERT INTO audit (secret_name, reason, action, scope, ttl_expires_at) VALUES (?, ?, ?, ?, ?)`
     );
-    this.checkTtlStmt = this.db.prepare(
+
+    // Check if a specific secret has an active approval
+    this.checkSecretTtlStmt = this.db.prepare(
       `SELECT ttl_expires_at FROM audit
        WHERE secret_name = ? AND action IN ('approved', 'auto_approved')
          AND ttl_expires_at > datetime('now')
        ORDER BY ttl_expires_at DESC LIMIT 1`
     );
+
+    // Check if a vault has a vault-wide active approval
+    this.checkVaultTtlStmt = this.db.prepare(
+      `SELECT ttl_expires_at FROM audit
+       WHERE secret_name = ? AND scope = 'vault'
+         AND action IN ('approved', 'auto_approved')
+         AND ttl_expires_at > datetime('now')
+       ORDER BY ttl_expires_at DESC LIMIT 1`
+    );
   }
 
-  log(secretName: string, reason: string, action: AuditEntry["action"], ttlMinutes?: number): void {
+  log(
+    secretName: string,
+    reason: string,
+    action: AuditEntry["action"],
+    scope: AuditEntry["scope"] = "secret",
+    ttlMinutes?: number
+  ): void {
     const ttlExpiresAt = ttlMinutes
       ? new Date(Date.now() + ttlMinutes * 60_000).toISOString()
       : null;
-    this.insertStmt.run(secretName, reason, action, ttlExpiresAt);
+    this.insertStmt.run(secretName, reason, action, scope, ttlExpiresAt);
   }
 
-  /** Check if this secret has an active TTL approval window */
-  hasActiveApproval(secretName: string): boolean {
-    const row = this.checkTtlStmt.get(secretName) as { ttl_expires_at: string } | undefined;
+  /** Check if this specific secret has an active approval window */
+  hasActiveSecretApproval(secretKey: string): boolean {
+    const row = this.checkSecretTtlStmt.get(secretKey) as { ttl_expires_at: string } | undefined;
     return !!row;
+  }
+
+  /** Check if this vault has an active vault-wide approval window */
+  hasActiveVaultApproval(vaultName: string): boolean {
+    const row = this.checkVaultTtlStmt.get(vaultName) as { ttl_expires_at: string } | undefined;
+    return !!row;
+  }
+
+  /** Check if access is permitted — either secret-level or vault-level */
+  isPermitted(vaultName: string, secretKey: string): boolean {
+    return this.hasActiveVaultApproval(vaultName) || this.hasActiveSecretApproval(secretKey);
   }
 
   close(): void {

@@ -1,18 +1,52 @@
 {
   "name": "agent-vault",
   "version": "0.1.0",
-  "description": "Secret access proxy for AI agents with human-in-the-loop approval",
+  "description": "Human-in-the-loop secret access for AI coding agents",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
     "agent-vault": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "agent-vault.config.example.json",
+    ".env.secrets.example",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js"
   },
+  "keywords": [
+    "mcp",
+    "secrets",
+    "1password",
+    "ai-agent",
+    "claude",
+    "cursor",
+    "approval",
+    "vault"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/loonshoot/agent_vault.git"
+  },
+  "homepage": "https://github.com/loonshoot/agent_vault",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@1password/sdk": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@1password/sdk": {
+      "optional": true
+    }
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@ngrok/ngrok": "^1.7.0",

@@ -3,26 +3,40 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ApprovalServer } from "./approval.js";
 import { AuditLog } from "./audit.js";
-import { createMcpServer } from "./server.js";
+import { loadConfig } from "./config.js";
+import { createMcpServer, type VaultInstance } from "./server.js";
+import { WebhookDispatcher } from "./webhooks.js";
 import { EnvFileProvider } from "./providers/env-provider.js";
 import { OnePasswordProvider } from "./providers/onepassword-provider.js";
-import type { SecretProvider } from "./providers/provider.js";
+import type { ResolvedVaultConfig } from "./config.js";
 
 async function main() {
-  const provider = resolveProvider();
-  const port = parseInt(process.env.AGENT_VAULT_PORT || "9999", 10);
-  const ttlMinutes = parseInt(process.env.AGENT_VAULT_TTL_MINUTES || "0", 10);
-  const dbPath = process.env.AGENT_VAULT_DB || "agent-vault.db";
+  const config = loadConfig();
 
-  const approval = new ApprovalServer(port);
+  const approval = new ApprovalServer(config.port);
+  const dbPath = process.env.AGENT_VAULT_DB || "agent-vault.db";
   const audit = new AuditLog(dbPath);
 
-  // Start ngrok tunnel
+  // Build vault instances from config
+  const vaults: VaultInstance[] = [];
+  for (const [name, vaultConfig] of Object.entries(config.vaults)) {
+    const provider = createProvider(name, vaultConfig);
+    vaults.push({ name, provider, ttlMinutes: vaultConfig.ttl, ttlScope: vaultConfig.ttlScope });
+    console.error(`  Vault "${name}" → ${vaultConfig.type} (TTL: ${vaultConfig.ttl}m, scope: ${vaultConfig.ttlScope})`);
+  }
+
+  if (vaults.length === 0) {
+    console.error("Error: no vaults configured");
+    process.exit(1);
+  }
+
+  // Start approval server
   console.error("Starting approval server...");
-  const publicUrl = await approval.start();
+  const publicUrl = await approval.start(config.ngrokAuthToken);
   console.error(`Approval server ready: ${publicUrl}`);
 
-  const mcpServer = createMcpServer({ provider, approval, audit, ttlMinutes });
+  const webhooks = new WebhookDispatcher(config.webhooks);
+  const mcpServer = createMcpServer({ vaults, approval, audit, webhooks });
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
 
@@ -37,26 +51,23 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-function resolveProvider(): SecretProvider {
-  const providerType = process.env.AGENT_VAULT_PROVIDER || "env";
-
-  switch (providerType) {
+function createProvider(name: string, config: ResolvedVaultConfig) {
+  switch (config.type) {
     case "env": {
-      const path = process.env.AGENT_VAULT_ENV_FILE || ".env.secrets";
-      console.error(`Using env-file provider: ${path}`);
+      const path = config.file || ".env.secrets";
       return new EnvFileProvider(path);
     }
     case "1password": {
-      if (!process.env.OP_SERVICE_ACCOUNT_TOKEN) {
-        console.error("Error: OP_SERVICE_ACCOUNT_TOKEN is required for 1password provider");
+      if (!config.serviceAccountToken) {
+        console.error(`Error: vault "${name}" is type 1password but service account token is not set`);
         process.exit(1);
       }
-      const vaultIds = process.env.AGENT_VAULT_1P_VAULTS?.split(",").filter(Boolean) || [];
-      console.error(`Using 1password provider${vaultIds.length ? `: vaults ${vaultIds.join(", ")}` : ""}`);
-      return new OnePasswordProvider(vaultIds);
+      // Set the token for the 1Password SDK (it reads from env)
+      process.env.OP_SERVICE_ACCOUNT_TOKEN = config.serviceAccountToken;
+      return new OnePasswordProvider(config.vaultIds || []);
     }
     default:
-      console.error(`Unknown provider: ${providerType}`);
+      console.error(`Unknown provider type "${config.type}" for vault "${name}"`);
       process.exit(1);
   }
 }
