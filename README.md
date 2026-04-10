@@ -6,6 +6,8 @@ Agent Vault is an [MCP server](https://modelcontextprotocol.io) that sits betwee
 
 No secrets are baked into config files. No blanket access. You approve each request in real time, from wherever you are.
 
+Read the [Security Whitepaper](SECURITY_WHITEPAPER.md) for the full threat model, architecture, and rationale.
+
 ```
 Agent: "I need DATABASE_URL to run this migration"
   → 🔒 Approve access: https://abc123.ngrok-free.app/approve/xK9mQ2...
