@@ -1,5 +1,7 @@
 # Agent Vault
 
+> **Proof of Concept.** Agent Vault is a working prototype that demonstrates human-in-the-loop secret access for AI agents. The core approval workflow, audit logging, and multi-vault support are functional, but this is not production-hardened software. Notable gaps include unauthenticated approval endpoints (a co-located agent can self-approve — see the [Security Whitepaper](SECURITY_WHITEPAPER.md#22-co-located-agent-self-approval)), no approval endpoint authentication, and limited provider coverage. See [what's missing](#whats-missing) for the full list.
+
 Human-in-the-loop secret access for AI coding agents.
 
 Agent Vault is an [MCP server](https://modelcontextprotocol.io) that sits between AI agents (Claude Code, Cursor, Windsurf, etc.) and your password manager. When an agent needs a secret, you get a link — tap approve on your phone, and the agent gets the value. Deny, and it doesn't.
@@ -341,21 +343,6 @@ Each vault entry supports:
 |---|---|---|---|
 | `ngrokAuthToken` | string | — | ngrok auth token or `"env:VAR_NAME"` reference |
 | `port` | number | `9999` | Local port for the approval HTTP server |
-
-### Legacy env var mode
-
-If no config file is found, Agent Vault falls back to single-vault configuration via environment variables. This is for quick testing or simple setups:
-
-| Variable | Default | Description |
-|---|---|---|
-| `AGENT_VAULT_PROVIDER` | `env` | Provider: `env` or `1password` |
-| `AGENT_VAULT_ENV_FILE` | `.env.secrets` | Path to secrets file (env provider) |
-| `AGENT_VAULT_PORT` | `9999` | Local port for approval server |
-| `AGENT_VAULT_TTL_MINUTES` | `0` | Auto-approve window in minutes |
-| `AGENT_VAULT_DB` | `agent-vault.db` | SQLite database path |
-| `NGROK_AUTHTOKEN` | — | ngrok auth token |
-| `OP_SERVICE_ACCOUNT_TOKEN` | — | 1Password service account token |
-| `AGENT_VAULT_1P_VAULTS` | — | Comma-separated vault IDs |
 
 ## MCP tools
 
@@ -905,6 +892,21 @@ Rules:
 ```
 
 For teams, commit this to your repo so every agent session follows the same rules.
+
+## What's missing
+
+Agent Vault demonstrates the concept but has known gaps that must be addressed before use in sensitive environments:
+
+| Gap | Risk | Planned mitigation |
+|---|---|---|
+| **No approval endpoint auth** | A co-located agent can `curl` the approval endpoint to self-approve | HMAC-signed approval tokens, push-based approval |
+| **Shared network** | Agent and approval server on the same host — no network isolation | Support running the approval server on a separate host |
+| **Limited providers** | Only 1Password and env files | Bitwarden, HashiCorp Vault, AWS/GCP/Azure secret managers |
+| **No secret redaction** | Approved secrets appear in MCP tool responses and may be logged by the agent platform | Out of scope (transport-layer concern), but worth noting |
+| **SQLite audit only** | Local audit log is deletable by the agent | Remote/append-only audit backends |
+| **ngrok dependency** | Free tier has session limits; single point of failure for remote approval | Support alternative tunneling (Cloudflare Tunnel, Tailscale Funnel) or direct HTTPS |
+
+For the full threat model and hardening roadmap, see the [Security Whitepaper](SECURITY_WHITEPAPER.md).
 
 ## Roadmap
 

@@ -6,6 +6,10 @@ Version 1.0 — April 2026
 
 ---
 
+## Status
+
+**Agent Vault is a proof of concept.** The implementation demonstrates the architecture and workflows described in this paper, but it is not production-hardened. In particular, the approval endpoints lack authentication (Section 2.2), the audit log is a local SQLite file deletable by the agent, and provider coverage is limited to 1Password and env files. This paper describes both the current state and the target architecture — Section 8 details the work required to close the remaining gaps.
+
 ## Abstract
 
 AI coding agents are transforming software development. Tools like Claude Code, Cursor, and Windsurf can write code, run tests, deploy services, and manage infrastructure — often in headless, sandboxed environments with minimal human oversight. But as agents gain capability, a critical security gap has emerged: how do agents access secrets?
@@ -76,7 +80,29 @@ Agent Vault is designed to mitigate the following threat categories:
 
 **Compromised or misbehaving agents.** Whether through prompt injection, model misbehavior, or supply chain compromise of agent tooling, an agent may attempt to exfiltrate secrets. A blanket-access model provides no defense; an approval model limits the blast radius to only the secrets explicitly approved during the session.
 
-### 2.2 What we are not defending against
+### 2.2 Co-located agent self-approval
+
+When Agent Vault runs on the same host as the agent, a critical trust boundary issue arises: the agent has network access to the approval server and can approve its own requests.
+
+The attack is straightforward. The approval server listens on a local port (default 9999). When a secret is requested, a unique approval URL is generated — e.g., `http://localhost:9999/approve/abc123`. The agent is not given this URL directly; it receives only a "waiting for approval" message. However, an agent with shell access can discover the URL by scanning the local port, reading the server's stderr output, or simply brute-forcing the 16-character approval ID space (which, while large, is not the point — the agent could also `curl` the root dashboard endpoint to list all pending requests, or inspect the server's process memory).
+
+This is not a theoretical concern. Any agent running in a typical development environment (Claude Code, Cursor, etc.) has full shell access and can execute arbitrary HTTP requests. The approval workflow provides no security against a co-located agent that decides to bypass it.
+
+**Current mitigations:**
+
+- **ngrok tunneling.** When ngrok is configured, approval URLs use a public ngrok domain rather than localhost. However, the agent can still reach the ngrok URL — it's public by design. Ngrok adds network indirection, not authentication.
+- **TTL windows.** Time-scoped approvals limit the blast radius if self-approval occurs, but do not prevent it.
+- **Audit logging.** Self-approved requests are logged identically to human-approved ones, making forensic detection possible but not prevention.
+
+**Planned mitigations (see Section 8.2):**
+
+- **Authenticated approval endpoints** — require a token or session cookie that only the human possesses
+- **Network isolation** — run the approval server on a separate host or network segment unreachable by the agent
+- **Push-based approval** — deliver approval prompts via a channel the agent cannot intercept (push notifications, SMS, authenticator app)
+
+Until these mitigations are implemented, Agent Vault's approval workflow should be considered a **deterrent and audit mechanism** against co-located agents, not a hard security boundary. It is effective against accidental or unintentional secret access (the most common failure mode), but not against a deliberately adversarial agent on the same host.
+
+### 2.3 What we are not defending against
 
 Agent Vault operates at the secret *access* layer, not the secret *usage* layer. Once a secret is approved and delivered to the agent, what the agent does with it is outside Agent Vault's control. This is the same trust boundary that exists when a human developer retrieves a credential from their password manager — the password manager cannot control what happens after the clipboard paste.
 
@@ -89,7 +115,7 @@ Specifically, Agent Vault does not:
 
 These are real concerns, but they exist in every current approach to agent secret access. Agent Vault reduces the attack surface by ensuring secrets are only delivered when explicitly approved, are scoped by time and context, and are fully audited.
 
-### 2.3 Security properties
+### 2.4 Security properties
 
 Agent Vault provides the following security properties:
 
@@ -383,6 +409,16 @@ The current implementation provides the core approval workflow with 1Password an
 - **Secret classification:** Tag secrets with risk levels that map to approval policies automatically
 - **Session-scoped access:** Tie approval windows to specific agent sessions rather than wall-clock time
 - **Revocation:** Ability to revoke an active approval window mid-session
+
+### 8.2 Approval hardening
+
+The co-located self-approval attack (Section 2.2) is the most significant architectural limitation in the current design. The following mitigations are planned, in order of implementation complexity:
+
+**Authenticated approval endpoints.** Add an HMAC-signed token to each approval URL. The token is derived from a secret that is set at server startup and never exposed to the agent via MCP. The approval server validates the token on every POST to `/approve/:id/yes` and `/approve/:id/no`. Without the token, the request is rejected. This prevents an agent from approving requests by directly hitting the endpoint — even if it discovers the approval ID, it cannot forge the authentication token.
+
+**Separate approval channel.** Move the approval server to a different host, network segment, or process that the agent cannot reach. The MCP handler (which the agent communicates with via stdio) forwards approval requests to the remote approval server over an authenticated channel. The agent's network environment is configured (via firewall rules, container networking, or sandbox policy) to block access to the approval server's address. This is the strongest mitigation for self-hosted deployments and requires no changes to the agent platform.
+
+**Push-based approval.** Replace the pull-based "open this URL" model with push notifications delivered to a channel the agent cannot intercept: mobile push notifications (via a companion app or integration with existing authenticator apps), SMS, or email. The approval decision is sent back to the server via the push channel, not via an HTTP endpoint the agent can reach. This eliminates the network-reachability attack entirely and is the recommended approach for high-security environments.
 
 ---
 
