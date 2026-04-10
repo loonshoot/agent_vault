@@ -11,6 +11,8 @@ export interface VaultConfig {
    * - "vault": approving any secret approves the entire vault for the TTL window
    */
   ttlScope?: "secret" | "vault";
+  /** Whether agents can create/update secrets in this vault (default: false) */
+  writable?: boolean;
 
   // env provider
   file?: string;
@@ -18,6 +20,13 @@ export interface VaultConfig {
   // 1password provider
   serviceAccountToken?: string;
   vaultIds?: string[];
+  /** Write config for 1password — which vault and category to create items in */
+  write?: {
+    /** The 1Password vault ID to create new items in */
+    vaultId: string;
+    /** Item category (default: "login") */
+    category?: string;
+  };
 }
 
 export interface WebhookConfig {
@@ -55,9 +64,14 @@ export interface ResolvedVaultConfig {
   type: "env" | "1password";
   ttl: number;
   ttlScope: "secret" | "vault";
+  writable: boolean;
   file?: string;
   serviceAccountToken?: string;
   vaultIds?: string[];
+  write?: {
+    vaultId: string;
+    category: string;
+  };
 }
 
 /**
@@ -132,6 +146,7 @@ function parseConfigFile(configPath: string): ResolvedConfig {
       type: vault.type,
       ttl: vault.ttl ?? 0,
       ttlScope: vault.ttlScope ?? "secret",
+      writable: vault.writable ?? false,
     };
 
     if (vault.type === "env") {
@@ -144,6 +159,12 @@ function parseConfigFile(configPath: string): ResolvedConfig {
     if (vault.type === "1password") {
       resolved.serviceAccountToken = resolveEnvRef(vault.serviceAccountToken);
       resolved.vaultIds = vault.vaultIds;
+      if (vault.write) {
+        resolved.write = {
+          vaultId: vault.write.vaultId,
+          category: vault.write.category ?? "login",
+        };
+      }
     }
 
     vaults[name] = resolved;
@@ -174,6 +195,7 @@ function buildLegacyConfig(): ResolvedConfig {
       type: "1password",
       ttl,
       ttlScope: "secret",
+      writable: false,
       serviceAccountToken: process.env.OP_SERVICE_ACCOUNT_TOKEN,
       vaultIds: process.env.AGENT_VAULT_1P_VAULTS?.split(",").filter(Boolean),
     };
@@ -182,6 +204,7 @@ function buildLegacyConfig(): ResolvedConfig {
       type: "env",
       ttl,
       ttlScope: "secret",
+      writable: false,
       file: resolve(process.env.AGENT_VAULT_ENV_FILE || ".env.secrets"),
     };
   }

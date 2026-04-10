@@ -13,12 +13,15 @@ export class OnePasswordProvider implements SecretProvider {
   readonly name = "1password";
   private client: any = null;
   private vaultIds: string[];
+  private writeConfig?: { vaultId: string; category: string };
 
   /**
    * @param vaultIds - Optional list of vault IDs to expose. If empty, all accessible vaults are listed.
+   * @param writeConfig - Optional write config specifying which vault and category to create items in.
    */
-  constructor(vaultIds: string[] = []) {
+  constructor(vaultIds: string[] = [], writeConfig?: { vaultId: string; category: string }) {
     this.vaultIds = vaultIds;
+    this.writeConfig = writeConfig;
   }
 
   private async getClient() {
@@ -73,5 +76,57 @@ export class OnePasswordProvider implements SecretProvider {
     throw new Error(
       `Invalid secret reference "${id}". Use op://vault/item/field format.`
     );
+  }
+
+  async setSecret(id: string, value: string): Promise<void> {
+    if (!this.writeConfig) {
+      throw new Error(
+        "1Password write config not set. Add a 'write' section to your vault config with 'vaultId' and optionally 'category'."
+      );
+    }
+
+    const client = await this.getClient();
+    const { vaultId, category } = this.writeConfig;
+
+    // Check if item already exists by searching for it
+    let existingItem: any = null;
+    try {
+      const items = await client.items.listAll(vaultId);
+      for await (const item of items) {
+        if (item.title === id) {
+          existingItem = item;
+          break;
+        }
+      }
+    } catch {
+      // Vault may not be listable — proceed to create
+    }
+
+    if (existingItem) {
+      // Update existing item — fetch full item, update the password/value field
+      const fullItem = await client.items.get(vaultId, existingItem.id);
+      for (const field of fullItem.fields) {
+        if (field.fieldType === "Concealed" || field.id === "password") {
+          field.value = value;
+          break;
+        }
+      }
+      await client.items.put(fullItem);
+    } else {
+      // Create new item
+      await client.items.create({
+        vaultId,
+        title: id,
+        category,
+        fields: [
+          {
+            id: "password",
+            title: "password",
+            fieldType: "Concealed",
+            value,
+          },
+        ],
+      });
+    }
   }
 }

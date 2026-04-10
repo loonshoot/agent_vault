@@ -10,6 +10,7 @@ export interface VaultInstance {
   provider: SecretProvider;
   ttlMinutes: number;
   ttlScope: "secret" | "vault";
+  writable: boolean;
 }
 
 export interface AgentVaultConfig {
@@ -192,6 +193,115 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
     }
   );
 
+  // ── set_secret (single write) ────────────────────────────────────────
+
+  server.tool(
+    "set_secret",
+    "Create or update a secret in a writable vault. The user will be prompted to approve via a link. Use this to persist credentials the agent has generated (API keys, tokens, etc.) so they don't get lost in chat history.",
+    {
+      vault: z.string().describe("The vault name to write to (must be writable)"),
+      name: z.string().describe("The name/ID for the secret"),
+      value: z.string().describe("The secret value to store"),
+      reason: z.string().describe("Why you're creating/updating this secret — shown to the approver"),
+    },
+    async ({ vault: vaultName, name, value, reason }) => {
+      const vault = findVault(vaults, vaultName);
+      if (!vault) {
+        return errorResponse(`Vault "${vaultName}" not found. Available: ${vaults.map((v) => v.name).join(", ")}`);
+      }
+      if (!vault.writable) {
+        return errorResponse(`Vault "${vaultName}" is not writable. Set "writable": true in your config to enable writes.`);
+      }
+      if (!vault.provider.setSecret) {
+        return errorResponse(`Provider "${vault.provider.name}" does not support writing secrets.`);
+      }
+
+      const masked = maskValue(value);
+      const { url, waitForApproval } = approval.requestApproval(
+        `${vaultName} / ${name}`,
+        reason,
+        { action: "write", maskedValue: masked }
+      );
+      console.error(`\n🔒 Approve WRITE of "${name}" to vault "${vaultName}": ${url}\n`);
+
+      const approved = await waitForApproval;
+
+      if (!approved) {
+        audit.log(`${vaultName}/${name}`, reason, "denied", "secret");
+        webhooks.dispatch(writeEvent(vaultName, [name], reason, "denied"));
+        return errorResponse(`Write of "${name}" to vault "${vaultName}" was DENIED.`);
+      }
+
+      await vault.provider.setSecret(name, value);
+      audit.log(`${vaultName}/${name}`, reason, "approved", "secret");
+      webhooks.dispatch(writeEvent(vaultName, [name], reason, "approved"));
+
+      return {
+        content: [{ type: "text" as const, text: `Secret "${name}" saved to vault "${vaultName}".` }],
+      };
+    }
+  );
+
+  // ── set_secrets (batch write) ──────────────────────────────────────
+
+  server.tool(
+    "set_secrets",
+    "Create or update multiple secrets at once with a single approval. Use this during bootstrapping when generating multiple credentials.",
+    {
+      vault: z.string().describe("The vault name to write to (must be writable)"),
+      secrets: z.array(z.object({
+        name: z.string().describe("The name/ID for the secret"),
+        value: z.string().describe("The secret value to store"),
+      })).describe("List of secrets to create/update"),
+      reason: z.string().describe("Why you're creating/updating these secrets — shown to the approver"),
+    },
+    async ({ vault: vaultName, secrets, reason }) => {
+      const vault = findVault(vaults, vaultName);
+      if (!vault) {
+        return errorResponse(`Vault "${vaultName}" not found. Available: ${vaults.map((v) => v.name).join(", ")}`);
+      }
+      if (!vault.writable) {
+        return errorResponse(`Vault "${vaultName}" is not writable. Set "writable": true in your config to enable writes.`);
+      }
+      if (!vault.provider.setSecret) {
+        return errorResponse(`Provider "${vault.provider.name}" does not support writing secrets.`);
+      }
+
+      const names = secrets.map((s) => s.name);
+      const maskedPreviews = secrets.map((s) => `${s.name}: ${maskValue(s.value)}`).join("\n");
+      const label = secrets.length === 1
+        ? `${vaultName} / ${names[0]}`
+        : `${vaultName} / ${secrets.length} secrets: ${names.join(", ")}`;
+
+      const { url, waitForApproval } = approval.requestApproval(
+        label,
+        reason,
+        { action: "write", maskedValue: maskedPreviews }
+      );
+      console.error(`\n🔒 Approve WRITE of [${names.join(", ")}] to vault "${vaultName}": ${url}\n`);
+
+      const approved = await waitForApproval;
+
+      if (!approved) {
+        for (const name of names) {
+          audit.log(`${vaultName}/${name}`, reason, "denied", "secret");
+        }
+        webhooks.dispatch(writeEvent(vaultName, names, reason, "denied"));
+        return errorResponse(`Write of ${secrets.length} secret(s) to vault "${vaultName}" was DENIED.`);
+      }
+
+      for (const secret of secrets) {
+        await vault.provider.setSecret!(secret.name, secret.value);
+        audit.log(`${vaultName}/${secret.name}`, reason, "approved", "secret");
+      }
+      webhooks.dispatch(writeEvent(vaultName, names, reason, "approved"));
+
+      return {
+        content: [{ type: "text" as const, text: `${secrets.length} secret(s) saved to vault "${vaultName}": ${names.join(", ")}` }],
+      };
+    }
+  );
+
   return server;
 }
 
@@ -248,4 +358,27 @@ function accessEvent(
       ? new Date(Date.now() + ttlMinutes * 60_000).toISOString()
       : null,
   };
+}
+
+function writeEvent(
+  vault: string,
+  secrets: string[],
+  reason: string,
+  action: "approved" | "denied"
+): AccessEvent {
+  return {
+    timestamp: new Date().toISOString(),
+    vault,
+    secrets,
+    reason,
+    action,
+    scope: "secret",
+    ttlExpiresAt: null,
+  };
+}
+
+/** Mask a secret value for display: show first 3 and last 3 chars */
+function maskValue(value: string): string {
+  if (value.length <= 8) return "***";
+  return `${value.slice(0, 3)}${"*".repeat(Math.min(value.length - 6, 20))}${value.slice(-3)}`;
 }

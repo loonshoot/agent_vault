@@ -128,7 +128,7 @@ Agent Vault is an MCP (Model Context Protocol) server that acts as a proxy betwe
 
 ### 3.2 Components
 
-**MCP Server.** The agent-facing interface. Exposes three tools via the Model Context Protocol: `list_secrets` (enumerate available secrets without revealing values), `get_secret` (request a single secret with a reason), and `get_secrets` (request multiple secrets with a single approval). The MCP server communicates with agents via stdio transport, which is the standard for local MCP servers and is supported by all major agent platforms.
+**MCP Server.** The agent-facing interface. Exposes five tools via the Model Context Protocol: `list_secrets` (enumerate available secrets without revealing values), `get_secret` and `get_secrets` (request one or many secrets with a reason), and `set_secret` and `set_secrets` (create or update secrets in writable vaults). Read and write operations both require human approval. The MCP server communicates with agents via stdio transport, which is the standard for local MCP servers and is supported by all major agent platforms.
 
 **Provider Adapters.** Modular integrations with secret management systems. Each provider implements a three-method interface (`name`, `listSecrets`, `getSecret`), making it trivial to add new backends. The current implementation includes adapters for 1Password (via the official SDK with service accounts) and local `.env` files. The architecture supports running multiple providers simultaneously — for example, a 1Password vault for production secrets alongside an env file for local development tokens.
 
@@ -138,7 +138,23 @@ Agent Vault is an MCP (Model Context Protocol) server that acts as a proxy betwe
 
 **Audit Log.** A SQLite database that records every secret access event: timestamp, secret name, stated reason, action taken (approved, denied, or auto-approved), scope (secret or vault), and TTL expiration. This provides a complete forensic trail for security reviews and incident response.
 
-### 3.3 Request flow
+### 3.3 Write support
+
+Agents don't only consume secrets — they generate them. During bootstrapping, an agent might create API keys, generate database passwords, configure service-to-service tokens, or rotate credentials. Without a structured write path, these generated secrets end up printed to chat, where they are stored in conversation history, potentially logged by the platform, and easily lost.
+
+Agent Vault's write tools (`set_secret`, `set_secrets`) solve this by sending generated credentials directly to the vault with the same approval workflow as reads:
+
+1. The agent calls `set_secret` with a vault name, secret name, value, and reason
+2. The approval page displays a **WRITE** badge, the secret name, the reason, and a masked preview of the value (e.g. `sk-********************abc`)
+3. The user reviews and approves or denies
+4. On approval, the secret is written to the provider (appended to an env file, or created as a new item in 1Password)
+5. The value is never printed to the agent's chat or conversation history
+
+Write access is disabled by default and must be explicitly enabled per vault (`writable: true`). For 1Password vaults, a `write` configuration section specifies the target vault ID and item category, ensuring the agent cannot write to arbitrary locations.
+
+The audit log records write operations identically to reads, providing a complete trail of what was created, when, and why.
+
+### 3.4 Request flow
 
 1. The agent calls `get_secret` with a vault name, secret name, and a human-readable reason
 2. The policy engine checks for an active approval window (per-secret or per-vault)
@@ -151,7 +167,7 @@ Agent Vault is an MCP (Model Context Protocol) server that acts as a proxy betwe
 9. If denied: the agent receives a denial message; the audit log records the denial
 10. The agent continues (or adjusts its approach if denied)
 
-### 3.4 Configuration model
+### 3.5 Configuration model
 
 Agent Vault separates configuration into two layers:
 

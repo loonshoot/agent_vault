@@ -21,8 +21,8 @@ async function main() {
   const vaults: VaultInstance[] = [];
   for (const [name, vaultConfig] of Object.entries(config.vaults)) {
     const provider = createProvider(name, vaultConfig);
-    vaults.push({ name, provider, ttlMinutes: vaultConfig.ttl, ttlScope: vaultConfig.ttlScope });
-    console.error(`  Vault "${name}" → ${vaultConfig.type} (TTL: ${vaultConfig.ttl}m, scope: ${vaultConfig.ttlScope})`);
+    vaults.push({ name, provider, ttlMinutes: vaultConfig.ttl, ttlScope: vaultConfig.ttlScope, writable: vaultConfig.writable });
+    console.error(`  Vault "${name}" → ${vaultConfig.type} (TTL: ${vaultConfig.ttl}m, scope: ${vaultConfig.ttlScope}${vaultConfig.writable ? ", writable" : ""})`);
   }
 
   if (vaults.length === 0) {
@@ -64,7 +64,7 @@ function createProvider(name: string, config: ResolvedVaultConfig) {
       }
       // Set the token for the 1Password SDK (it reads from env)
       process.env.OP_SERVICE_ACCOUNT_TOKEN = config.serviceAccountToken;
-      return new OnePasswordProvider(config.vaultIds || []);
+      return new OnePasswordProvider(config.vaultIds || [], config.write);
     }
     default:
       console.error(`Unknown provider type "${config.type}" for vault "${name}"`);

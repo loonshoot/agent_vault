@@ -326,9 +326,12 @@ Each vault entry supports:
 | `type` | `"env"` or `"1password"` | yes | Provider type |
 | `ttl` | number | no | Approval window in minutes (default: `0` = always ask) |
 | `ttlScope` | `"secret"` or `"vault"` | no | What the approval window covers (default: `"secret"`) |
+| `writable` | boolean | no | Whether agents can create/update secrets (default: `false`) |
 | `file` | string | env only | Path to `.env`-style secrets file (relative to config file) |
 | `serviceAccountToken` | string | 1password only | Service account token or `"env:VAR_NAME"` reference |
 | `vaultIds` | string[] | no | 1Password vault IDs to expose (default: all accessible) |
+| `write.vaultId` | string | 1password only | Vault ID to create new items in (required if `writable: true`) |
+| `write.category` | string | no | 1Password item category (default: `"login"`) |
 
 ### Top-level configuration
 
@@ -407,6 +410,57 @@ Requests access to multiple secrets in a single approval. The approver sees the 
 **Example:** an agent needs both `DATABASE_URL` and `DATABASE_PASSWORD` to run a migration. Instead of two separate approval links, you get one that says "2 secrets: DATABASE_URL, DATABASE_PASSWORD" — tap approve once.
 
 If some secrets already have active approval windows, only the ones that need approval are shown in the request. If all are already permitted, the call returns immediately with no approval needed.
+
+### `set_secret`
+
+Create or update a secret in a writable vault. The approval page shows a **WRITE** badge and a masked preview of the value (e.g. `sk-********************abc`) so you can sanity-check without the full value being displayed.
+
+**Parameters:**
+| Name | Type | Description |
+|---|---|---|
+| `vault` | string | The vault name (must have `writable: true` in config) |
+| `name` | string | The name/ID for the secret |
+| `value` | string | The secret value to store |
+| `reason` | string | Why the agent is creating/updating this secret |
+
+Use this when the agent generates a credential (API key, token, password) and needs to persist it safely. The secret goes straight to the vault instead of being printed to chat where it gets lost or leaked.
+
+### `set_secrets`
+
+Batch version — create or update multiple secrets with a single approval. Ideal for bootstrapping flows.
+
+**Parameters:**
+| Name | Type | Description |
+|---|---|---|
+| `vault` | string | The vault name (must have `writable: true`) |
+| `secrets` | `{name, value}[]` | List of secrets to create/update |
+| `reason` | string | Why the agent is creating these secrets |
+
+### Enabling writes
+
+Writes are disabled by default. To enable, set `writable: true` on the vault in your config:
+
+```json
+{
+  "vaults": {
+    "dev": {
+      "type": "1password",
+      "serviceAccountToken": "env:OP_DEV_TOKEN",
+      "writable": true,
+      "write": {
+        "vaultId": "your-1password-vault-id",
+        "category": "login"
+      },
+      "ttl": 15,
+      "ttlScope": "vault"
+    }
+  }
+}
+```
+
+For env file vaults, no extra config is needed — `writable: true` is sufficient and secrets are appended to (or updated in) the `.env` file.
+
+For 1Password vaults, the `write` section specifies which vault ID to create items in and what item category to use (defaults to `"login"`). The service account must have write access to that vault.
 
 ## Providers
 
@@ -713,9 +767,11 @@ Docs: https://github.com/loonshoot/agent_vault
 ### Setup with 1Password
 
 ```
-Set up agent-vault so you can request secrets from my 1Password with my approval.
-When you need a credential, you call a tool, I get a link on my phone, and I tap
-approve or deny. It's an npm package — no cloning needed.
+Set up agent-vault so you can securely request and store secrets from my 1Password
+when you need them. When you need a credential, you call a tool, I get a link on
+my phone, and I tap approve or deny. When you generate a credential, you save it
+straight to the vault instead of printing it to chat. It's an npm package — no
+cloning needed.
 
 Docs: https://github.com/loonshoot/agent_vault
 
@@ -732,25 +788,38 @@ Docs: https://github.com/loonshoot/agent_vault
        }
      }
    }
-2. Create an `agent-vault.config.json` in THIS project directory with:
+
+2. Create an agent-vault.config.json in THIS project directory:
    {
      "vaults": {
-       "dev": {
+       "1password": {
          "type": "1password",
          "serviceAccountToken": "env:OP_SERVICE_ACCOUNT_TOKEN",
          "ttl": 15,
-         "ttlScope": "vault"
+         "ttlScope": "vault",
+         "writable": true,
+         "write": {
+           "vaultId": "<I will provide>",
+           "category": "login"
+         }
        }
      },
      "ngrokAuthToken": "env:NGROK_AUTHTOKEN"
    }
-3. Show me the final config and tell me which env vars I need to set:
-   - OP_SERVICE_ACCOUNT_TOKEN: 1Password service account token (how to create one)
-   - NGROK_AUTHTOKEN: free ngrok.com auth token
-4. After I've set my tokens, test by calling list_secrets, then get_secret on
-   one of them so I can test the approval flow from my phone.
 
-Walk me through each step. Wait for my confirmation before moving on.
+3. Show me the config and remind me I need:
+   - OP_SERVICE_ACCOUNT_TOKEN: 1Password service account token with read+write
+     (1password.com → Integrations → Service Accounts → create with access to my vault)
+   - NGROK_AUTHTOKEN: free at ngrok.com/signup → Your Authtoken
+   - The 1Password vault ID for the write.vaultId field
+
+4. Once I provide those values, update the config, then test by calling
+   list_secrets, then get_secret on one of them so I can test the approval flow.
+
+From then on:
+- Use get_secret / get_secrets when you need credentials — I'll approve from my phone
+- Use set_secret / set_secrets when you generate credentials (API keys, tokens, etc.)
+  — save them to the vault instead of printing them to chat
 ```
 
 ### Remote / headless setup
@@ -812,9 +881,15 @@ When you need a secret:
 3. Wait for the user to approve via the link — do not proceed without approval
 4. Use the returned value directly — do not log, echo, or store it anywhere
 
+When you generate a secret (API key, token, password, connection string):
+1. Call `set_secret` or `set_secrets` to persist it to a writable vault
+2. Wait for the user to approve the write
+3. Do NOT print the raw secret value to chat — it goes straight to the vault
+4. Confirm the save was successful and reference the secret by name
+
 Rules:
-- Always use `get_secrets` (batch) when you need more than one secret at a time —
-  it sends a single approval request instead of one per secret
+- Always use batch tools (`get_secrets`, `set_secrets`) when working with
+  more than one secret — sends a single approval instead of one per secret
 - Always provide a specific, honest reason (e.g. "Need DATABASE_URL to run the
   pending migration" not "need credentials")
 - If access is denied, do not re-request the same secret — ask the user what
@@ -823,6 +898,8 @@ Rules:
 - If a command needs a secret as an argument, prefer environment variable
   injection (e.g. `DATABASE_URL=<value> npm run migrate`) over passing it
   as a CLI flag where it would appear in process lists
+- When bootstrapping a new service, use `set_secrets` to save all generated
+  credentials in one batch rather than printing them to chat
 ```
 
 For teams, commit this to your repo so every agent session follows the same rules.

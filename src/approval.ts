@@ -7,6 +7,10 @@ export interface ApprovalRequest {
   id: string;
   secretName: string;
   reason: string;
+  /** For write requests: "write", for read requests: "read" */
+  action: "read" | "write";
+  /** Masked preview of the value for write requests */
+  maskedValue?: string;
   createdAt: Date;
   resolve: (approved: boolean) => void;
 }
@@ -29,10 +33,19 @@ export class ApprovalServer {
         return;
       }
 
+      const actionLabel = request.action === "write" ? "Write Secret Request" : "Secret Access Request";
+      const actionBadge = request.action === "write"
+        ? `<span class="badge write">WRITE</span>`
+        : `<span class="badge read">READ</span>`;
+      const maskedLine = request.maskedValue
+        ? `<p><strong>Value preview:</strong> <code>${escapeHtml(request.maskedValue)}</code></p>`
+        : "";
+
       res.send(this.renderPage(
-        "Secret Access Request",
+        actionLabel,
         `<div class="request-info">
-          <p><strong>Secret:</strong> ${escapeHtml(request.secretName)}</p>
+          <p>${actionBadge} <strong>Secret:</strong> ${escapeHtml(request.secretName)}</p>
+          ${maskedLine}
           <p><strong>Reason:</strong> ${escapeHtml(request.reason)}</p>
           <p><strong>Requested:</strong> ${request.createdAt.toLocaleString()}</p>
         </div>
@@ -115,7 +128,11 @@ export class ApprovalServer {
    * The returned promise resolves to `true` (approved) or `false` (denied)
    * when the user clicks the link.
    */
-  requestApproval(secretName: string, reason: string): { url: string; waitForApproval: Promise<boolean> } {
+  requestApproval(
+    secretName: string,
+    reason: string,
+    options?: { action?: "read" | "write"; maskedValue?: string }
+  ): { url: string; waitForApproval: Promise<boolean> } {
     const id = nanoid(16);
     const url = `${this.publicUrl}/approve/${id}`;
 
@@ -124,6 +141,8 @@ export class ApprovalServer {
         id,
         secretName,
         reason,
+        action: options?.action ?? "read",
+        maskedValue: options?.maskedValue,
         createdAt: new Date(),
         resolve,
       });
@@ -154,6 +173,14 @@ export class ApprovalServer {
     h1 { font-size: 20px; margin-bottom: 20px; color: #fff; }
     .request-info { margin-bottom: 24px; }
     .request-info p { margin-bottom: 8px; font-size: 15px; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 4px;
+      font-size: 11px; font-weight: 700; letter-spacing: 0.5px; margin-right: 6px;
+      vertical-align: middle;
+    }
+    .badge.read { background: #1e3a5f; color: #60a5fa; }
+    .badge.write { background: #5f1e3a; color: #f472b6; }
+    code { background: #2a2a2a; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
     .actions { display: flex; gap: 12px; }
     .btn {
       flex: 1; padding: 14px 24px; border: none; border-radius: 8px;
