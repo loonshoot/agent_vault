@@ -22,5 +22,19 @@
     }
   },
   "ngrokAuthToken": "env:NGROK_AUTHTOKEN",
-  "port": 9999
+  "port": 9999,
+
+  "_comment_transport": "Uncomment to run as one shared HTTP process for multiple workers instead of stdio. Also settable via --http/--port/--host or AGENT_VAULT_TRANSPORT/AGENT_VAULT_HTTP_PORT/AGENT_VAULT_HTTP_HOST.",
+  "transport": "stdio",
+  "httpPort": 8080,
+  "httpHost": "127.0.0.1",
+
+  "webhooks": [
+    {
+      "_comment": "Free, zero-signup push notifications the instant any worker blocks on a secret. Pick a long random topic name.",
+      "url": "https://ntfy.sh/agent-vault-<pick-something-random-and-unguessable>",
+      "format": "ntfy",
+      "events": ["pending"]
+    }
+  ]
 }

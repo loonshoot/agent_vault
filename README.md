@@ -94,7 +94,46 @@ That's it. Every project on your machine can use it — no cloning, no per-proje
 
 ### Add to Cursor / other MCP clients
 
-Agent Vault uses stdio transport. Point your client at `npx agent-vault` with the environment variables above.
+Agent Vault uses stdio transport by default. Point your client at `npx agent-vault` with the environment variables above.
+
+### Multi-worker / HTTP transport
+
+By default, Agent Vault runs over **stdio** — one subprocess per client, spawned by your MCP client's config. That's the right model for a single developer with a single agent session.
+
+If you're running **multiple agents/workers against the same vault config** (e.g. several headless Claude Code sessions, or a CI fleet), stdio means each one spawns its own isolated subprocess — its own `pending` approval map, its own TTL cache, its own audit log. You'd get pinged separately per worker even for the same vault, and TTL windows wouldn't be shared.
+
+`--http` runs Agent Vault as **one long-lived process** that multiple remote clients connect to over the network, sharing a single pending-approval map, TTL cache, and audit log:
+
+```bash
+# stdio (default) — unchanged
+npx agent-vault
+
+# HTTP transport — one shared process on port 8080
+npx agent-vault --http
+npx agent-vault --http --port 8080 --host 0.0.0.0
+```
+
+Equivalent env vars / config file fields (useful when you don't control the invocation, e.g. a systemd unit or Docker `CMD`):
+
+```bash
+AGENT_VAULT_TRANSPORT=http
+AGENT_VAULT_HTTP_PORT=8080
+AGENT_VAULT_HTTP_HOST=0.0.0.0   # default: 127.0.0.1
+```
+
+```json
+{
+  "transport": "http",
+  "httpPort": 8080,
+  "httpHost": "0.0.0.0"
+}
+```
+
+Precedence: `--http`/`--port`/`--host` CLI flags > `AGENT_VAULT_TRANSPORT`/`AGENT_VAULT_HTTP_PORT`/`AGENT_VAULT_HTTP_HOST` env vars > `transport`/`httpPort`/`httpHost` in the config file > default (`stdio`).
+
+Point MCP clients at the resulting endpoint (`http://<host>:<port>/mcp`) using their HTTP/Streamable-HTTP transport option instead of `command`/`args`.
+
+**Note on binding to `0.0.0.0`:** this exposes the MCP endpoint to your network, not just localhost. Combine it with a firewall, VPN, or reverse-proxy auth — the approval server's own auth gaps (see [Security considerations](#security-considerations)) apply equally here.
 
 ## Usage examples
 
@@ -378,6 +417,11 @@ Requests access to a single secret. Use `get_secrets` (below) when you need mult
 | `vault` | string | The vault name (as defined in your config) |
 | `name` | string | The name or ID of the secret |
 | `reason` | string | Why the agent needs this secret (shown to the approver) |
+| `requesterId` | string (optional) | Identity of the requesting worker/agent — shown to the approver for attribution when running multiple workers (e.g. against the [HTTP transport](#multi-worker--http-transport)) |
+| `taskId` | string (optional) | Task/job identifier this request is on behalf of |
+| `branch` | string (optional) | Branch or workspace identifier |
+
+All three are optional and backward compatible — omitting them displays as "unknown worker" on the approval page and in the audit log; existing callers need no changes. `get_secrets`, `set_secret`, and `set_secrets` accept the same three optional parameters.
 
 The tool call **blocks** until you approve or deny. The agent cannot proceed without your decision.
 
@@ -595,7 +639,8 @@ Add a `webhooks` array to your config:
 |---|---|---|---|
 | `url` | string | *required* | Endpoint to POST events to |
 | `authorization` | string | — | `Authorization` header value (supports `env:` references) |
-| `events` | `"all"` or array | `"all"` | Which events to send: `"approved"`, `"denied"`, `"auto_approved"` |
+| `events` | `"all"` or array | `"all"` | Which events to send: `"pending"`, `"approved"`, `"denied"`, `"auto_approved"` |
+| `format` | `"json"` or `"ntfy"` | `"json"` | `"json"` sends the structured event body below. `"ntfy"` sends a human-readable plain-text message plus [ntfy.sh](https://ntfy.sh) notification headers — see [Push notifications with ntfy.sh](#push-notifications-with-ntfysh) |
 
 ### Event payload
 
@@ -610,20 +655,61 @@ Every event is a JSON POST with this shape:
   "reason": "Need database credentials to run migration 0042",
   "action": "approved",
   "scope": "vault",
-  "ttlExpiresAt": "2026-04-10T14:47:01.000Z"
+  "ttlExpiresAt": "2026-04-10T14:47:01.000Z",
+  "requesterId": "churn-preset",
+  "taskId": "task-142"
 }
 ```
 
 | Field | Description |
 |---|---|
-| `event` | Always `"secret_access"` |
-| `timestamp` | ISO 8601 when the decision was made |
+| `event` | `"secret_access"` for resolved requests, `"secret_pending"` for pending requests (see below) |
+| `timestamp` | ISO 8601 when the event fired |
 | `vault` | Which vault was accessed |
 | `secrets` | Array of secret names in the request |
 | `reason` | The agent's stated reason |
-| `action` | `"approved"`, `"denied"`, or `"auto_approved"` |
-| `scope` | `"secret"` or `"vault"` — what the approval covered |
-| `ttlExpiresAt` | When the approval window expires (null if no TTL) |
+| `action` | `"pending"`, `"approved"`, `"denied"`, or `"auto_approved"` |
+| `scope` | `"secret"` or `"vault"` — what the approval covered (resolved events only) |
+| `ttlExpiresAt` | When the approval window expires (null if no TTL, resolved events only) |
+| `requesterId` / `taskId` / `branch` | Attribution fields, if the calling agent supplied them (optional) |
+
+### The "pending" event — know the instant a worker is blocked
+
+`approved`/`denied`/`auto_approved` all fire **after** a human (or the TTL cache) has already resolved the request — nothing tells you a worker is sitting there blocked *right now*. The `pending` event closes that gap: it fires the instant `get_secret`/`get_secrets`/`set_secret`/`set_secrets` creates a new approval request, before anyone has acted on it.
+
+```json
+{
+  "event": "secret_pending",
+  "timestamp": "2026-04-10T14:32:00.000Z",
+  "vault": "prod",
+  "secrets": ["DATABASE_URL"],
+  "reason": "Run migration 0042",
+  "action": "pending",
+  "requesterId": "churn-preset",
+  "taskId": "task-142",
+  "approvalUrl": "https://abc123.ngrok-free.app/approve/xK9mQ2..."
+}
+```
+
+The `approvalUrl` is included deliberately — this event only ever reaches an endpoint *you* configured (your own logging/notification channel), which is the same out-of-band trust boundary that already delivers the link via the terminal. **It is never included in the MCP tool response returned to the calling agent** — that response only ever contains the approve/deny outcome, never the URL or the pending-request ID (this is the same structural mitigation against co-located agent self-approval described in the [Security Whitepaper](SECURITY_WHITEPAPER.md#22-co-located-agent-self-approval)).
+
+### Push notifications with ntfy.sh
+
+[ntfy.sh](https://ntfy.sh) is a free, zero-signup push notification service — pick a random topic name, subscribe to it in the ntfy app (iOS/Android/web), and POSTs to `https://ntfy.sh/<topic>` show up as a phone notification within seconds. It's the fastest way to get "a worker needs your approval" pushed to your phone without standing up any infrastructure.
+
+```json
+{
+  "webhooks": [
+    {
+      "url": "https://ntfy.sh/agent-vault-<pick-something-random-and-unguessable>",
+      "format": "ntfy",
+      "events": ["pending"]
+    }
+  ]
+}
+```
+
+Subscribe to the same topic in the ntfy app (or `https://ntfy.sh/<topic>` in a browser) and you'll get a push the moment any worker blocks on a secret — title "Agent Vault: approval needed", body showing the worker/task attribution and reason, tap-to-open pointed straight at the approval link. Use a long random topic name (ntfy topics are public-by-obscurity, same trust model as the approval URL itself) or self-host ntfy for anything sensitive.
 
 ### Example integrations
 
@@ -703,9 +789,12 @@ The interface is intentionally minimal — three members, no lifecycle methods, 
 ```
 src/
 ├── index.ts                  Entry point — wires provider, approval server, and MCP server
-├── server.ts                 MCP server with list_secrets and get_secret tools
-├── approval.ts               Express HTTP server + ngrok tunnel for approve/deny pages
-├── audit.ts                  SQLite audit log with TTL-based auto-approval checks
+├── cli-args.ts                Parses --http / --port / --host flags
+├── server.ts                  MCP server with list_secrets, get_secret(s), set_secret(s) tools
+├── approval.ts                Express HTTP server + ngrok tunnel for approve/deny pages
+├── http-transport.ts           Streamable HTTP MCP transport (multi-worker mode)
+├── audit.ts                   SQLite audit log with TTL-based auto-approval checks
+├── webhooks.ts                 Observability webhooks, incl. the "pending" event + ntfy.sh format
 └── providers/
     ├── provider.ts           SecretProvider interface
     ├── env-provider.ts       .env file provider
@@ -914,7 +1003,8 @@ For the full threat model and hardening roadmap, see the [Security Whitepaper](S
 - [ ] HashiCorp Vault provider
 - [ ] AWS Secrets Manager provider
 - [ ] Secret classification levels (auto-approve low-risk, always prompt for high-risk)
-- [ ] Multiple approval channels (Telegram, Slack, ntfy.sh) as alternatives to the link
+- [x] ntfy.sh push notifications on the "pending" webhook event (see [Push notifications with ntfy.sh](#push-notifications-with-ntfysh))
+- [ ] Additional approval channels (Telegram, Slack) as alternatives to the link
 - [ ] Bulk approval ("approve all secrets for this session")
 - [ ] Web dashboard for audit log
 
