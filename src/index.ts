@@ -6,16 +6,28 @@ import { AuditLog } from "./audit.js";
 import { loadConfig } from "./config.js";
 import { createMcpServer, type VaultInstance } from "./server.js";
 import { WebhookDispatcher } from "./webhooks.js";
+import { startHttpTransport } from "./http-transport.js";
 import { EnvFileProvider } from "./providers/env-provider.js";
 import { OnePasswordProvider } from "./providers/onepassword-provider.js";
 import type { ResolvedVaultConfig } from "./config.js";
+import { parseCliArgs } from "./cli-args.js";
 
 async function main() {
   const config = loadConfig();
+  const cli = parseCliArgs(process.argv.slice(2));
 
-  const approval = new ApprovalServer(config.port);
+  const useHttp = cli.http ?? config.transport === "http";
+  const httpPort = cli.port ?? config.httpPort;
+  const httpHost = cli.host ?? config.httpHost;
+
   const dbPath = process.env.AGENT_VAULT_DB || "agent-vault.db";
   const audit = new AuditLog(dbPath);
+  const webhooks = new WebhookDispatcher(config.webhooks);
+  // ApprovalServer holds the single shared `pending` map for this process —
+  // in HTTP mode every remote client shares this one instance (and therefore
+  // one pending map, one audit log, one webhook dispatcher) instead of each
+  // getting its own fragmented stdio subprocess's state.
+  const approval = new ApprovalServer(config.port, webhooks);
 
   // Build vault instances from config
   const vaults: VaultInstance[] = [];
@@ -35,14 +47,29 @@ async function main() {
   const publicUrl = await approval.start(config.ngrokAuthToken);
   console.error(`Approval server ready: ${publicUrl}`);
 
-  const webhooks = new WebhookDispatcher(config.webhooks);
-  const mcpServer = createMcpServer({ vaults, approval, audit, webhooks });
-  const transport = new StdioServerTransport();
-  await mcpServer.connect(transport);
+  // Shared across every request/session: `vaults`, `approval` (and its
+  // `pending` map), `audit` (TTL cache + log), and `webhooks`. In HTTP mode a
+  // fresh McpServer wrapper is created per request (required by the SDK's
+  // stateless transport — see http-transport.ts), but it's just protocol
+  // glue around this same shared config — no state is fragmented.
+  const buildMcpServer = () => createMcpServer({ vaults, approval, audit, webhooks });
+
+  let httpServer: import("node:http").Server | undefined;
+  if (useHttp) {
+    console.error(`Starting MCP HTTP transport on ${httpHost}:${httpPort}...`);
+    httpServer = await startHttpTransport(buildMcpServer, { port: httpPort, host: httpHost });
+  } else {
+    const mcpServer = buildMcpServer();
+    const transport = new StdioServerTransport();
+    await mcpServer.connect(transport);
+  }
 
   // Cleanup on exit
   const cleanup = async () => {
     console.error("Shutting down...");
+    if (httpServer) {
+      await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
+    }
     await approval.stop();
     audit.close();
     process.exit(0);
