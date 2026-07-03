@@ -69,8 +69,11 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       vault: z.string().describe("The vault name containing the secret"),
       name: z.string().describe("The name/ID of the secret to access"),
       reason: z.string().describe("Why you need this secret — shown to the approver"),
+      requesterId: z.string().optional().describe("Identity of the requesting worker/agent (optional, shown to the approver for attribution)"),
+      taskId: z.string().optional().describe("Task or job identifier this request is on behalf of (optional)"),
+      branch: z.string().optional().describe("Branch or workspace identifier (optional)"),
     },
-    async ({ vault: vaultName, name, reason }) => {
+    async ({ vault: vaultName, name, reason, requesterId, taskId, branch }) => {
       const vault = findVault(vaults, vaultName);
       if (!vault) {
         return errorResponse(`Vault "${vaultName}" not found. Available: ${vaults.map((v) => v.name).join(", ")}`);
@@ -81,8 +84,8 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       // Check permission cache (secret-level or vault-level)
       if (audit.isPermitted(vaultName, auditKey)) {
         const value = await vault.provider.getSecret(name);
-        audit.log(auditKey, reason, "auto_approved", "secret");
-        webhooks.dispatch(accessEvent(vaultName, [name], reason, "auto_approved", "secret"));
+        audit.log(auditKey, reason, "auto_approved", "secret", undefined, requesterId, taskId, branch);
+        webhooks.dispatch(accessEvent(vaultName, [name], reason, "auto_approved", "secret", undefined, requesterId, taskId, branch));
         return {
           content: [{ type: "text" as const, text: `[Auto-approved — active approval window]\n\n${value}` }],
         };
@@ -91,15 +94,16 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       // Request approval
       const { url, waitForApproval } = approval.requestApproval(
         `${vaultName} / ${name}`,
-        reason
+        reason,
+        { vault: vaultName, secrets: [name], requesterId, taskId, branch }
       );
       console.error(`\n🔒 Approve access to "${name}" from vault "${vaultName}": ${url}\n`);
 
       const approved = await waitForApproval;
 
       if (!approved) {
-        audit.log(auditKey, reason, "denied", "secret");
-        webhooks.dispatch(accessEvent(vaultName, [name], reason, "denied", "secret"));
+        audit.log(auditKey, reason, "denied", "secret", undefined, requesterId, taskId, branch);
+        webhooks.dispatch(accessEvent(vaultName, [name], reason, "denied", "secret", undefined, requesterId, taskId, branch));
         return errorResponse(`Access to "${name}" from vault "${vaultName}" was DENIED.`);
       }
 
@@ -107,8 +111,8 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       const scope = vault.ttlScope;
       const logKey = scope === "vault" ? vaultName : auditKey;
       const ttl = vault.ttlMinutes || undefined;
-      audit.log(logKey, reason, "approved", scope, ttl);
-      webhooks.dispatch(accessEvent(vaultName, [name], reason, "approved", scope, ttl));
+      audit.log(logKey, reason, "approved", scope, ttl, requesterId, taskId, branch);
+      webhooks.dispatch(accessEvent(vaultName, [name], reason, "approved", scope, ttl, requesterId, taskId, branch));
 
       return {
         content: [{ type: "text" as const, text: value }],
@@ -125,8 +129,11 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       vault: z.string().describe("The vault name containing the secrets"),
       names: z.array(z.string()).describe("List of secret names/IDs to access"),
       reason: z.string().describe("Why you need these secrets — shown to the approver"),
+      requesterId: z.string().optional().describe("Identity of the requesting worker/agent (optional, shown to the approver for attribution)"),
+      taskId: z.string().optional().describe("Task or job identifier this request is on behalf of (optional)"),
+      branch: z.string().optional().describe("Branch or workspace identifier (optional)"),
     },
-    async ({ vault: vaultName, names, reason }) => {
+    async ({ vault: vaultName, names, reason, requesterId, taskId, branch }) => {
       const vault = findVault(vaults, vaultName);
       if (!vault) {
         return errorResponse(`Vault "${vaultName}" not found. Available: ${vaults.map((v) => v.name).join(", ")}`);
@@ -148,7 +155,7 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       // If everything is already permitted, fetch all
       if (needsApproval.length === 0) {
         const results = await fetchSecrets(vault, names, reason, audit, vaultName);
-        webhooks.dispatch(accessEvent(vaultName, names, reason, "auto_approved", "secret"));
+        webhooks.dispatch(accessEvent(vaultName, names, reason, "auto_approved", "secret", undefined, requesterId, taskId, branch));
         return {
           content: [{ type: "text" as const, text: `[Auto-approved — active approval window]\n\n${formatResults(results)}` }],
         };
@@ -160,16 +167,22 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
         ? `${vaultName} / ${needsApproval[0]}`
         : `${vaultName} / ${needsApproval.length} secrets: ${secretList}`;
 
-      const { url, waitForApproval } = approval.requestApproval(label, reason);
+      const { url, waitForApproval } = approval.requestApproval(label, reason, {
+        vault: vaultName,
+        secrets: needsApproval,
+        requesterId,
+        taskId,
+        branch,
+      });
       console.error(`\n🔒 Approve access to [${secretList}] from vault "${vaultName}": ${url}\n`);
 
       const approved = await waitForApproval;
 
       if (!approved) {
         for (const name of needsApproval) {
-          audit.log(`${vaultName}/${name}`, reason, "denied", "secret");
+          audit.log(`${vaultName}/${name}`, reason, "denied", "secret", undefined, requesterId, taskId, branch);
         }
-        webhooks.dispatch(accessEvent(vaultName, needsApproval, reason, "denied", "secret"));
+        webhooks.dispatch(accessEvent(vaultName, needsApproval, reason, "denied", "secret", undefined, requesterId, taskId, branch));
         return errorResponse(`Access to ${needsApproval.length} secret(s) from vault "${vaultName}" was DENIED.`);
       }
 
@@ -177,13 +190,13 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       const scope = vault.ttlScope;
       const ttl = vault.ttlMinutes || undefined;
       if (scope === "vault") {
-        audit.log(vaultName, reason, "approved", "vault", ttl);
+        audit.log(vaultName, reason, "approved", "vault", ttl, requesterId, taskId, branch);
       } else {
         for (const name of needsApproval) {
-          audit.log(`${vaultName}/${name}`, reason, "approved", "secret", ttl);
+          audit.log(`${vaultName}/${name}`, reason, "approved", "secret", ttl, requesterId, taskId, branch);
         }
       }
-      webhooks.dispatch(accessEvent(vaultName, needsApproval, reason, "approved", scope, ttl));
+      webhooks.dispatch(accessEvent(vaultName, needsApproval, reason, "approved", scope, ttl, requesterId, taskId, branch));
 
       // Fetch all secrets (both previously permitted and newly approved)
       const results = await fetchSecrets(vault, names, reason, audit, vaultName);
@@ -203,8 +216,11 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       name: z.string().describe("The name/ID for the secret"),
       value: z.string().describe("The secret value to store"),
       reason: z.string().describe("Why you're creating/updating this secret — shown to the approver"),
+      requesterId: z.string().optional().describe("Identity of the requesting worker/agent (optional, shown to the approver for attribution)"),
+      taskId: z.string().optional().describe("Task or job identifier this request is on behalf of (optional)"),
+      branch: z.string().optional().describe("Branch or workspace identifier (optional)"),
     },
-    async ({ vault: vaultName, name, value, reason }) => {
+    async ({ vault: vaultName, name, value, reason, requesterId, taskId, branch }) => {
       const vault = findVault(vaults, vaultName);
       if (!vault) {
         return errorResponse(`Vault "${vaultName}" not found. Available: ${vaults.map((v) => v.name).join(", ")}`);
@@ -220,26 +236,26 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       const { url, waitForApproval } = approval.requestApproval(
         `${vaultName} / ${name}`,
         reason,
-        { action: "write", maskedValue: masked }
+        { action: "write", maskedValue: masked, vault: vaultName, secrets: [name], requesterId, taskId, branch }
       );
       console.error(`\n🔒 Approve WRITE of "${name}" to vault "${vaultName}": ${url}\n`);
 
       const approved = await waitForApproval;
 
       if (!approved) {
-        audit.log(`${vaultName}/${name}`, reason, "denied", "secret");
-        webhooks.dispatch(writeEvent(vaultName, [name], reason, "denied"));
+        audit.log(`${vaultName}/${name}`, reason, "denied", "secret", undefined, requesterId, taskId, branch);
+        webhooks.dispatch(writeEvent(vaultName, [name], reason, "denied", requesterId, taskId, branch));
         return errorResponse(`Write of "${name}" to vault "${vaultName}" was DENIED.`);
       }
 
       try {
         await vault.provider.setSecret(name, value);
       } catch (err: any) {
-        audit.log(`${vaultName}/${name}`, reason, "denied", "secret");
+        audit.log(`${vaultName}/${name}`, reason, "denied", "secret", undefined, requesterId, taskId, branch);
         return errorResponse(`Failed to write "${name}" to vault "${vaultName}": ${err.message}`);
       }
-      audit.log(`${vaultName}/${name}`, reason, "approved", "secret");
-      webhooks.dispatch(writeEvent(vaultName, [name], reason, "approved"));
+      audit.log(`${vaultName}/${name}`, reason, "approved", "secret", undefined, requesterId, taskId, branch);
+      webhooks.dispatch(writeEvent(vaultName, [name], reason, "approved", requesterId, taskId, branch));
 
       return {
         content: [{ type: "text" as const, text: `Secret "${name}" saved to vault "${vaultName}".` }],
@@ -259,8 +275,11 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
         value: z.string().describe("The secret value to store"),
       })).describe("List of secrets to create/update"),
       reason: z.string().describe("Why you're creating/updating these secrets — shown to the approver"),
+      requesterId: z.string().optional().describe("Identity of the requesting worker/agent (optional, shown to the approver for attribution)"),
+      taskId: z.string().optional().describe("Task or job identifier this request is on behalf of (optional)"),
+      branch: z.string().optional().describe("Branch or workspace identifier (optional)"),
     },
-    async ({ vault: vaultName, secrets, reason }) => {
+    async ({ vault: vaultName, secrets, reason, requesterId, taskId, branch }) => {
       const vault = findVault(vaults, vaultName);
       if (!vault) {
         return errorResponse(`Vault "${vaultName}" not found. Available: ${vaults.map((v) => v.name).join(", ")}`);
@@ -281,7 +300,7 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       const { url, waitForApproval } = approval.requestApproval(
         label,
         reason,
-        { action: "write", maskedValue: maskedPreviews }
+        { action: "write", maskedValue: maskedPreviews, vault: vaultName, secrets: names, requesterId, taskId, branch }
       );
       console.error(`\n🔒 Approve WRITE of [${names.join(", ")}] to vault "${vaultName}": ${url}\n`);
 
@@ -289,9 +308,9 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
 
       if (!approved) {
         for (const name of names) {
-          audit.log(`${vaultName}/${name}`, reason, "denied", "secret");
+          audit.log(`${vaultName}/${name}`, reason, "denied", "secret", undefined, requesterId, taskId, branch);
         }
-        webhooks.dispatch(writeEvent(vaultName, names, reason, "denied"));
+        webhooks.dispatch(writeEvent(vaultName, names, reason, "denied", requesterId, taskId, branch));
         return errorResponse(`Write of ${secrets.length} secret(s) to vault "${vaultName}" was DENIED.`);
       }
 
@@ -299,18 +318,18 @@ export function createMcpServer(config: AgentVaultConfig): McpServer {
       for (const secret of secrets) {
         try {
           await vault.provider.setSecret!(secret.name, secret.value);
-          audit.log(`${vaultName}/${secret.name}`, reason, "approved", "secret");
+          audit.log(`${vaultName}/${secret.name}`, reason, "approved", "secret", undefined, requesterId, taskId, branch);
           saved.push(secret.name);
         } catch (err: any) {
-          audit.log(`${vaultName}/${secret.name}`, reason, "denied", "secret");
-          webhooks.dispatch(writeEvent(vaultName, saved, reason, "approved"));
+          audit.log(`${vaultName}/${secret.name}`, reason, "denied", "secret", undefined, requesterId, taskId, branch);
+          webhooks.dispatch(writeEvent(vaultName, saved, reason, "approved", requesterId, taskId, branch));
           return errorResponse(
             `Failed to write "${secret.name}" to vault "${vaultName}": ${err.message}` +
             (saved.length ? ` (${saved.length} secret(s) saved before failure: ${saved.join(", ")})` : "")
           );
         }
       }
-      webhooks.dispatch(writeEvent(vaultName, names, reason, "approved"));
+      webhooks.dispatch(writeEvent(vaultName, names, reason, "approved", requesterId, taskId, branch));
 
       return {
         content: [{ type: "text" as const, text: `${secrets.length} secret(s) saved to vault "${vaultName}": ${names.join(", ")}` }],
@@ -361,7 +380,10 @@ function accessEvent(
   reason: string,
   action: AccessEvent["action"],
   scope: AccessEvent["scope"],
-  ttlMinutes?: number
+  ttlMinutes?: number,
+  requesterId?: string,
+  taskId?: string,
+  branch?: string
 ): AccessEvent {
   return {
     timestamp: new Date().toISOString(),
@@ -373,6 +395,9 @@ function accessEvent(
     ttlExpiresAt: ttlMinutes
       ? new Date(Date.now() + ttlMinutes * 60_000).toISOString()
       : null,
+    requesterId,
+    taskId,
+    branch,
   };
 }
 
@@ -380,7 +405,10 @@ function writeEvent(
   vault: string,
   secrets: string[],
   reason: string,
-  action: "approved" | "denied"
+  action: "approved" | "denied",
+  requesterId?: string,
+  taskId?: string,
+  branch?: string
 ): AccessEvent {
   return {
     timestamp: new Date().toISOString(),
@@ -390,6 +418,9 @@ function writeEvent(
     action,
     scope: "secret",
     ttlExpiresAt: null,
+    requesterId,
+    taskId,
+    branch,
   };
 }
 

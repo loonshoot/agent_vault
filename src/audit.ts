@@ -9,6 +9,12 @@ export interface AuditEntry {
   action: "approved" | "denied" | "auto_approved";
   scope: "secret" | "vault";
   ttlExpiresAt: string | null;
+  /** Identity of the requesting worker/agent, if provided (for multi-worker traceability) */
+  requesterId: string | null;
+  /** Task or job identifier the request was made on behalf of, if provided */
+  taskId: string | null;
+  /** Branch or workspace identifier, if provided */
+  branch: string | null;
 }
 
 export class AuditLog {
@@ -18,7 +24,11 @@ export class AuditLog {
   private checkVaultTtlStmt: Database.Statement;
 
   constructor(dbPath: string = "agent-vault.db") {
-    this.db = new Database(resolve(dbPath));
+    // ":memory:" is SQLite's special in-memory database identifier — must be
+    // passed through as-is (resolve() would otherwise turn it into a bogus
+    // relative file path). Useful for tests that want a real AuditLog without
+    // touching disk.
+    this.db = new Database(dbPath === ":memory:" ? dbPath : resolve(dbPath));
     this.db.pragma("journal_mode = WAL");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS audit (
@@ -31,9 +41,11 @@ export class AuditLog {
         ttl_expires_at TEXT
       )
     `);
+    this.migrateRequesterColumns();
 
     this.insertStmt = this.db.prepare(
-      `INSERT INTO audit (secret_name, reason, action, scope, ttl_expires_at) VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO audit (secret_name, reason, action, scope, ttl_expires_at, requester_id, task_id, branch)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     // Check if a specific secret has an active approval
@@ -54,17 +66,45 @@ export class AuditLog {
     );
   }
 
+  /**
+   * `requesterId` / `taskId` / `branch` are optional for backward compatibility —
+   * existing callers that omit them keep working, and those entries display as
+   * "unknown worker" wherever attribution is rendered.
+   */
   log(
     secretName: string,
     reason: string,
     action: AuditEntry["action"],
     scope: AuditEntry["scope"] = "secret",
-    ttlMinutes?: number
+    ttlMinutes?: number,
+    requesterId?: string,
+    taskId?: string,
+    branch?: string
   ): void {
     const ttlExpiresAt = ttlMinutes
       ? new Date(Date.now() + ttlMinutes * 60_000).toISOString()
       : null;
-    this.insertStmt.run(secretName, reason, action, scope, ttlExpiresAt);
+    this.insertStmt.run(
+      secretName,
+      reason,
+      action,
+      scope,
+      ttlExpiresAt,
+      requesterId ?? null,
+      taskId ?? null,
+      branch ?? null
+    );
+  }
+
+  /** Add requester/task/branch columns to pre-existing databases created before this feature. */
+  private migrateRequesterColumns(): void {
+    const columns = this.db.prepare(`PRAGMA table_info(audit)`).all() as { name: string }[];
+    const existing = new Set(columns.map((c) => c.name));
+    for (const col of ["requester_id", "task_id", "branch"]) {
+      if (!existing.has(col)) {
+        this.db.exec(`ALTER TABLE audit ADD COLUMN ${col} TEXT`);
+      }
+    }
   }
 
   /** Check if this specific secret has an active approval window */
