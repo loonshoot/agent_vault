@@ -50,8 +50,31 @@ export interface WebhookConfig {
   format?: "json" | "ntfy";
 }
 
+/**
+ * Outrun-managed mode. When present, approval / audit / revocation move to
+ * Outrun (no ngrok approval server); per-secret routing decides whether a value
+ * is served by Outrun (`readSecretFields`) or read from a local `vaults`
+ * provider (hybrid, mounted external vault). `apiKey` supports env: indirection
+ * like the rest of the config.
+ */
+export interface OutrunConfig {
+  /** Gateway base URL — requests POST to `${url}/graphql`. */
+  url: string;
+  /** Gateway API key (workspace-scoped, `action:secrets` capability). Supports env: refs. */
+  apiKey: string;
+  /** Workspace the key is scoped to. */
+  workspaceId: string;
+  /** Poll interval (ms) while waiting for a standalone approval (default 3000). */
+  pollIntervalMs?: number;
+  /** Approval wait timeout (ms) before giving up (default 900000 = 15 min). */
+  timeoutMs?: number;
+  /** Default requested TTL (minutes) when the agent doesn't specify one. */
+  defaultTtlMinutes?: number;
+}
+
 export interface AgentVaultConfigFile {
-  vaults: Record<string, VaultConfig>;
+  vaults?: Record<string, VaultConfig>;
+  outrun?: OutrunConfig;
   ngrokAuthToken?: string;
   port?: number;
   /** Webhook endpoints for observability — send access events to logging/analytics */
@@ -73,12 +96,22 @@ export interface AgentVaultConfigFile {
 /** Resolved config with env: references replaced by actual values */
 export interface ResolvedConfig {
   vaults: Record<string, ResolvedVaultConfig>;
+  outrun?: ResolvedOutrunConfig;
   ngrokAuthToken?: string;
   port: number;
   webhooks: ResolvedWebhookConfig[];
   transport: "stdio" | "http";
   httpPort: number;
   httpHost: string;
+}
+
+export interface ResolvedOutrunConfig {
+  url: string;
+  apiKey: string;
+  workspaceId: string;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+  defaultTtlMinutes?: number;
 }
 
 export interface ResolvedWebhookConfig {
@@ -167,7 +200,7 @@ function parseConfigFile(configPath: string): ResolvedConfig {
 
   const vaults: Record<string, ResolvedVaultConfig> = {};
 
-  for (const [name, vault] of Object.entries(parsed.vaults)) {
+  for (const [name, vault] of Object.entries(parsed.vaults ?? {})) {
     const resolved: ResolvedVaultConfig = {
       type: vault.type,
       ttl: vault.ttl ?? 0,
@@ -218,8 +251,28 @@ function parseConfigFile(configPath: string): ResolvedConfig {
 
   const httpHost = process.env.AGENT_VAULT_HTTP_HOST || parsed.httpHost || "127.0.0.1";
 
+  let outrun: ResolvedOutrunConfig | undefined;
+  if (parsed.outrun) {
+    const apiKey = resolveEnvRef(parsed.outrun.apiKey);
+    if (!apiKey) {
+      console.error(
+        `Error: "outrun" block is configured but its apiKey could not be resolved (check the env var it references).`
+      );
+      process.exit(1);
+    }
+    outrun = {
+      url: parsed.outrun.url,
+      apiKey,
+      workspaceId: parsed.outrun.workspaceId,
+      pollIntervalMs: parsed.outrun.pollIntervalMs,
+      timeoutMs: parsed.outrun.timeoutMs,
+      defaultTtlMinutes: parsed.outrun.defaultTtlMinutes,
+    };
+  }
+
   return {
     vaults,
+    outrun,
     ngrokAuthToken: resolveEnvRef(parsed.ngrokAuthToken),
     port: parsed.port ?? 9999,
     webhooks,

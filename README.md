@@ -741,6 +741,86 @@ Subscribe to the same topic in the ntfy app (or `https://ntfy.sh/<topic>` in a b
 
 Sending only `"denied"` events to Slack is a useful pattern — you get alerted when an agent is denied access, which may indicate something unexpected is happening.
 
+## Outrun-managed mode
+
+Agent Vault splits into two **independently pluggable** hooks:
+
+- **Secrets hook** (`SecretProvider`) — *where a value lives* (1Password, env file, or Outrun).
+- **Management hook** (`ManagementProvider`) — *who approves, audits, and revokes* access.
+
+By default both are **local**: the ngrok approval page decides, and a local SQLite file is the audit trail. Pointing the **management** hook at [Outrun](https://github.com/loonshoot/outrun) moves approval, audit, and revocation off your machine — closing the [co-located self-approval gap](SECURITY_WHITEPAPER.md#22-co-located-agent-self-approval) (the approval surface no longer lives on the agent's host) and making the audit trail server-side and tamper-resistant.
+
+Add an `outrun` block to enable it. `apiKey` is a workspace-scoped gateway API key (with the `action:secrets` capability) and supports `env:` indirection like everything else:
+
+```json
+{
+  "outrun": {
+    "url": "https://your-outrun-gateway.example.com",
+    "apiKey": "env:OUTRUN_API_KEY",
+    "workspaceId": "your-workspace-id",
+    "pollIntervalMs": 3000,
+    "timeoutMs": 900000,
+    "defaultTtlMinutes": 30
+  }
+}
+```
+
+There is **no ngrok/approval server** in Outrun mode. `get_secret` still **blocks** — the SDK requests a grant, then polls Outrun until you approve from anywhere (phone, email reply, Loops, Action Centre) or the request times out. An unexpired grant is reused from an in-process cache without a fresh approval, exactly like a local TTL window.
+
+### Three compositions
+
+| secrets | management | mode | what it means |
+|---|---|---|---|
+| 1Password / env | local | **local PoC** | today's default — nothing changes |
+| 1Password / env | outrun | **hybrid** | your existing vault is *mounted* in Outrun; values never leave it. Outrun runs the HITL approval, audit, and revocation; the SDK checks the grant and logs the use (with purpose) through Outrun *before* reading the value locally. Bring your old secrets with zero uploads. |
+| outrun | outrun | **full-remote** | the value is stored in and served by Outrun (AES-256-GCM at rest); server-enforced end to end. |
+
+**Hybrid** keeps a local `vaults` block — those providers become the local readers for mounted-external secrets:
+
+```json
+{
+  "vaults": {
+    "company-1p": {
+      "type": "1password",
+      "serviceAccountToken": "env:OP_SERVICE_ACCOUNT_TOKEN"
+    }
+  },
+  "outrun": {
+    "url": "https://your-outrun-gateway.example.com",
+    "apiKey": "env:OUTRUN_API_KEY",
+    "workspaceId": "your-workspace-id"
+  }
+}
+```
+
+**Full-remote** needs no `vaults` block at all — Outrun holds every value.
+
+### Per-secret routing (mixed migration)
+
+Hybrid vs full-remote is **not a config switch** — the SDK routes **per secret** off the metadata Outrun returns: a `storage: 'outrun'` item is fetched via `readSecretFields`; a `storage: 'external'` item is read from the local provider matching its mounted vault. One session serves both kinds at once, so you can migrate gradually: mount your 1Password vault today, then rotate individual secrets into Outrun over time. Flipping a secret from external to Outrun-stored needs **no SDK, config, or workflow change** — the secret's name is the stable identifier.
+
+Writes (`set_secret`/`set_secrets`) are not available in Outrun mode — create and rotate credentials in the Outrun UI.
+
+### Claude Code quickstart (Outrun mode)
+
+```json
+{
+  "mcpServers": {
+    "agent-vault": {
+      "command": "npx",
+      "args": ["agent-vault"],
+      "env": {
+        "AGENT_VAULT_CONFIG": "/absolute/path/to/agent-vault.config.json",
+        "OUTRUN_API_KEY": "your_workspace_gateway_key",
+        "OP_SERVICE_ACCOUNT_TOKEN": "your_1password_token"
+      }
+    }
+  }
+}
+```
+
+(`OP_SERVICE_ACCOUNT_TOKEN` is only needed for hybrid mode, to read mounted-external values locally.) The agent-facing tool contract — `list_secrets`, `get_secret{name, reason}` — is identical across all three compositions; only `vault` becomes optional (ignored) in Outrun mode.
+
 ## Security considerations
 
 - **Secrets are transmitted over HTTPS** via the ngrok tunnel. The approval page never displays the secret value — only the name and reason.

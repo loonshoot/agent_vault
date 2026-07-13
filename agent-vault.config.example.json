@@ -24,6 +24,16 @@
   "ngrokAuthToken": "env:NGROK_AUTHTOKEN",
   "port": 9999,
 
+  "_comment_outrun": "Add an 'outrun' block to move approval/audit/revocation to Outrun (no ngrok). Keep 'vaults' for hybrid mode (existing vault mounted, values read locally) or drop it for full-remote. See the 'Outrun-managed mode' section of the README.",
+  "_outrun": {
+    "url": "https://your-outrun-gateway.example.com",
+    "apiKey": "env:OUTRUN_API_KEY",
+    "workspaceId": "your-workspace-id",
+    "pollIntervalMs": 3000,
+    "timeoutMs": 900000,
+    "defaultTtlMinutes": 30
+  },
+
   "_comment_transport": "Uncomment to run as one shared HTTP process for multiple workers instead of stdio. Also settable via --http/--port/--host or AGENT_VAULT_TRANSPORT/AGENT_VAULT_HTTP_PORT/AGENT_VAULT_HTTP_HOST.",
   "transport": "stdio",
   "httpPort": 8080,

@@ -11,6 +11,10 @@ import { EnvFileProvider } from "./providers/env-provider.js";
 import { OnePasswordProvider } from "./providers/onepassword-provider.js";
 import type { ResolvedVaultConfig } from "./config.js";
 import { parseCliArgs } from "./cli-args.js";
+import { OutrunClient } from "./outrun/client.js";
+import { OutrunManagement, OutrunBackend } from "./management/outrun-management.js";
+import { LocalManagement, LocalBackend } from "./management/local-management.js";
+import type { SecretBackend } from "./management/management.js";
 
 async function main() {
   const config = loadConfig();
@@ -21,15 +25,10 @@ async function main() {
   const httpHost = cli.host ?? config.httpHost;
 
   const dbPath = process.env.AGENT_VAULT_DB || "agent-vault.db";
-  const audit = new AuditLog(dbPath);
-  const webhooks = new WebhookDispatcher(config.webhooks);
-  // ApprovalServer holds the single shared `pending` map for this process —
-  // in HTTP mode every remote client shares this one instance (and therefore
-  // one pending map, one audit log, one webhook dispatcher) instead of each
-  // getting its own fragmented stdio subprocess's state.
-  const approval = new ApprovalServer(config.port, webhooks);
 
-  // Build vault instances from config
+  // Build vault instances from config. In local mode these ARE the vaults; in
+  // Outrun mode they are the local SecretProviders that read mounted-external
+  // (hybrid) values — Outrun-stored values never touch them.
   const vaults: VaultInstance[] = [];
   for (const [name, vaultConfig] of Object.entries(config.vaults)) {
     const provider = createProvider(name, vaultConfig);
@@ -37,22 +36,56 @@ async function main() {
     console.error(`  Vault "${name}" → ${vaultConfig.type} (TTL: ${vaultConfig.ttl}m, scope: ${vaultConfig.ttlScope}${vaultConfig.writable ? ", writable" : ""})`);
   }
 
-  if (vaults.length === 0) {
-    console.error("Error: no vaults configured");
-    process.exit(1);
+  let backend: SecretBackend;
+  let approval: ApprovalServer | undefined;
+  let audit: AuditLog | undefined;
+
+  if (config.outrun) {
+    // ── Outrun-managed mode: approval/audit/revocation live in Outrun. ──
+    // No approval server, no ngrok. Local providers (if any) serve hybrid
+    // mounted-external reads; a pure full-remote setup needs no vaults at all.
+    console.error(`Outrun-managed mode → ${config.outrun.url} (workspace ${config.outrun.workspaceId})`);
+    const client = new OutrunClient({
+      url: config.outrun.url,
+      apiKey: config.outrun.apiKey,
+      workspaceId: config.outrun.workspaceId,
+    });
+    const management = new OutrunManagement(client, {
+      pollIntervalMs: config.outrun.pollIntervalMs,
+      timeoutMs: config.outrun.timeoutMs,
+      defaultTtlMinutes: config.outrun.defaultTtlMinutes,
+    });
+    backend = new OutrunBackend(
+      client,
+      management,
+      vaults.map((v) => v.provider),
+      { defaultTtlMinutes: config.outrun.defaultTtlMinutes }
+    );
+  } else {
+    // ── Local mode: the original PoC composition. ──
+    if (vaults.length === 0) {
+      console.error("Error: no vaults configured (and no `outrun` block).");
+      process.exit(1);
+    }
+    audit = new AuditLog(dbPath);
+    const webhooks = new WebhookDispatcher(config.webhooks);
+    // ApprovalServer holds the single shared `pending` map for this process —
+    // in HTTP mode every remote client shares this one instance (and therefore
+    // one pending map, one audit log, one webhook dispatcher) instead of each
+    // getting its own fragmented stdio subprocess's state.
+    approval = new ApprovalServer(config.port, webhooks);
+
+    console.error("Starting approval server...");
+    const publicUrl = await approval.start(config.ngrokAuthToken);
+    console.error(`Approval server ready: ${publicUrl}`);
+
+    backend = new LocalBackend(vaults, new LocalManagement(approval, audit, webhooks));
   }
 
-  // Start approval server
-  console.error("Starting approval server...");
-  const publicUrl = await approval.start(config.ngrokAuthToken);
-  console.error(`Approval server ready: ${publicUrl}`);
-
-  // Shared across every request/session: `vaults`, `approval` (and its
-  // `pending` map), `audit` (TTL cache + log), and `webhooks`. In HTTP mode a
-  // fresh McpServer wrapper is created per request (required by the SDK's
-  // stateless transport — see http-transport.ts), but it's just protocol
-  // glue around this same shared config — no state is fragmented.
-  const buildMcpServer = () => createMcpServer({ vaults, approval, audit, webhooks });
+  // In HTTP mode a fresh McpServer wrapper is created per request (required by
+  // the SDK's stateless transport — see http-transport.ts), but it wraps this
+  // same shared backend, so no approval/audit/grant-cache state is fragmented.
+  const buildMcpServer = () => createMcpServer({ backend });
 
   let httpServer: import("node:http").Server | undefined;
   if (useHttp) {
@@ -70,8 +103,9 @@ async function main() {
     if (httpServer) {
       await new Promise<void>((resolve) => httpServer!.close(() => resolve()));
     }
-    await approval.stop();
-    audit.close();
+    await backend.management.stop?.();
+    if (approval) await approval.stop();
+    if (audit) audit.close();
     process.exit(0);
   };
   process.on("SIGINT", cleanup);
