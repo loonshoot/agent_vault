@@ -83,7 +83,7 @@ export function createMcpServer(config: AgentVaultConfig | BackendConfig): McpSe
 
   server.tool(
     "get_secret",
-    "Request access to a single secret. The user will be prompted to approve via a link (local mode) or through Outrun HITL. You MUST wait for the result. Prefer get_secrets when you need multiple secrets — it sends a single approval for all of them.",
+    "Request access to a single secret. This opens a human approval request (an Outrun HITL prompt, or an approval link in local mode) and BLOCKS until the human approves or denies — this can take minutes. Call this tool ONCE per secret and WAIT for it to return: do NOT call it again, retry, or poll yourself. The single call handles all the waiting and returns the secret value on approval, or an error on denial/timeout. Prefer get_secrets when you need multiple secrets — it sends a single approval for all of them.",
     {
       vault: z.string().optional().describe("The vault name containing the secret (required in local mode; ignored in Outrun mode, where secrets are addressed by name)"),
       name: z.string().describe("The name/ID of the secret to access"),
@@ -101,7 +101,7 @@ export function createMcpServer(config: AgentVaultConfig | BackendConfig): McpSe
 
   server.tool(
     "get_secrets",
-    "Request access to multiple secrets at once. Sends a SINGLE approval request for all of them — much better UX than requesting one at a time. The user sees the full list of what you need and approves or denies all at once.",
+    "Request access to multiple secrets at once. Sends a SINGLE approval request for all of them — much better UX than requesting one at a time. The user sees the full list of what you need and approves or denies all at once. This opens a human approval request and BLOCKS until the human approves or denies — this can take minutes. Call this tool ONCE and WAIT for it to return: do NOT call it again, retry, or poll yourself. The single call handles all the waiting and returns the secret values on approval, or an error on denial/timeout.",
     {
       vault: z.string().optional().describe("The vault name containing the secrets (required in local mode; ignored in Outrun mode)"),
       names: z.array(z.string()).describe("List of secret names/IDs to access"),

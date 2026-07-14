@@ -322,6 +322,103 @@ test("Outrun: an unexpired in-process grant is reused without a fresh approval r
   }
 });
 
+test("Outrun: requestAccess BLOCKS through pending→pending→active, resolving only at the terminal state", async () => {
+  const mock = new MockOutrun();
+  mock.secrets = [{ id: "sec-1", name: "OPENAI_KEY", storage: "outrun" }];
+  mock.values.set("sec-1", { api_key: "sk-live-abc123" });
+  // Two 'pending' polls before it flips to 'active' — the call must not return early.
+  mock.defaultPollsBeforeResolve = 3;
+  mock.install();
+  try {
+    const client = new OutrunClient({ url: "http://outrun.test", apiKey: "k", workspaceId: "ws-1" });
+    const management = new OutrunManagement(client, { pollIntervalMs: 2, timeoutMs: 500 });
+    const grant = await management.requestAccess({
+      secretNames: ["OPENAI_KEY"],
+      reason: "call the API",
+      action: "read",
+      requester: {},
+    });
+    assert.equal(grant.granted, true, "resolves granted only once the grant is active");
+    // It genuinely polled (did not return on the first 'pending').
+    const polled = mock.grants.get("grant-1")!.polls;
+    assert.ok(polled >= 3, `expected to poll until active, polled ${polled} times`);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("Outrun: requestAccess blocks then THROWS-through a denial (never returns granted)", async () => {
+  const mock = new MockOutrun();
+  mock.secrets = [{ id: "sec-1", name: "OPENAI_KEY", storage: "outrun" }];
+  mock.defaultPollsBeforeResolve = 2;
+  mock.defaultResolveTo = "denied";
+  mock.install();
+  try {
+    const client = new OutrunClient({ url: "http://outrun.test", apiKey: "k", workspaceId: "ws-1" });
+    const management = new OutrunManagement(client, { pollIntervalMs: 2, timeoutMs: 500 });
+    const grant = await management.requestAccess({
+      secretNames: ["OPENAI_KEY"],
+      reason: "call the API",
+      action: "read",
+      requester: {},
+    });
+    assert.equal(grant.granted, false);
+    assert.equal(grant.denialReason, "denied");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("Outrun: two concurrent get_secret calls for the SAME name issue only ONE requestSecretAccess (dedupe)", async () => {
+  const mock = new MockOutrun();
+  mock.secrets = [{ id: "sec-1", name: "OPENAI_KEY", storage: "outrun" }];
+  mock.values.set("sec-1", { api_key: "sk-live-abc123" });
+  // Stay pending for several polls so both calls overlap while the approval is
+  // in flight — the window in which a duplicate grant would otherwise be created.
+  mock.defaultPollsBeforeResolve = 4;
+  mock.install();
+  try {
+    const client = await connectClient(buildBackend(mock));
+    const [a, b] = await Promise.all([
+      client.callTool({ name: "get_secret", arguments: { name: "OPENAI_KEY", reason: "first" } }),
+      client.callTool({ name: "get_secret", arguments: { name: "OPENAI_KEY", reason: "second" } }),
+    ]);
+    assert.match(textOf(a), /sk-live-abc123/);
+    assert.match(textOf(b), /sk-live-abc123/);
+    // Only ONE approval was opened for the two overlapping requests.
+    assert.equal(mock.requestCalls.length, 1, "duplicate concurrent requests must share a single grant");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("Outrun: dedupe shares a denial across concurrent waiters, then a later call re-requests", async () => {
+  const mock = new MockOutrun();
+  mock.secrets = [{ id: "sec-1", name: "OPENAI_KEY", storage: "outrun" }];
+  mock.values.set("sec-1", { api_key: "sk-live-abc123" });
+  mock.defaultPollsBeforeResolve = 3;
+  mock.defaultResolveTo = "denied";
+  mock.install();
+  try {
+    const client = await connectClient(buildBackend(mock));
+    const [a, b] = await Promise.all([
+      client.callTool({ name: "get_secret", arguments: { name: "OPENAI_KEY", reason: "first" } }),
+      client.callTool({ name: "get_secret", arguments: { name: "OPENAI_KEY", reason: "second" } }),
+    ]);
+    assert.match(textOf(a), /DENIED/);
+    assert.match(textOf(b), /DENIED/);
+    assert.equal(mock.requestCalls.length, 1, "both waiters shared the one in-flight request");
+
+    // The in-flight slot cleared on settle: a fresh call after the denial re-requests.
+    mock.defaultResolveTo = "active";
+    const c = await client.callTool({ name: "get_secret", arguments: { name: "OPENAI_KEY", reason: "retry" } });
+    assert.match(textOf(c), /sk-live-abc123/);
+    assert.equal(mock.requestCalls.length, 2, "a later access after settle issues a new request");
+  } finally {
+    mock.restore();
+  }
+});
+
 test("Outrun list_secrets merges Outrun-stored items, external items, and mounted vaults", async () => {
   const mock = new MockOutrun();
   mock.secrets = [

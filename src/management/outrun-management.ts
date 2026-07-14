@@ -28,6 +28,25 @@ interface CachedGrant {
   expiresAt: number;
 }
 
+/** Resolution of a single acquired grant that reached `active`. */
+interface AcquiredGrant {
+  grantId: string;
+  /** epoch ms expiry, or null when the server returned no expiry. */
+  expiresAt: number | null;
+}
+
+/**
+ * A non-active terminal state (denied/revoked/expired/timeout) thrown out of the
+ * shared in-flight promise so every concurrent waiter on it gets the same clean
+ * denial. `status` is the terminal grant status for the caller's denialReason.
+ */
+class GrantNotApprovedError extends Error {
+  constructor(readonly status: string) {
+    super(`grant ${status}`);
+    this.name = "GrantNotApprovedError";
+  }
+}
+
 const TERMINAL = new Set(["active", "denied", "revoked", "expired"]);
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -55,6 +74,13 @@ export class OutrunManagement implements ManagementProvider {
   private pollIntervalMs: number;
   private timeoutMs: number;
   private grantCache = new Map<string, CachedGrant>();
+  /**
+   * In-flight approval requests keyed by secret name. A second get_secret for a
+   * name whose approval is still pending awaits THIS promise instead of issuing a
+   * duplicate `requestSecretAccess` — one human-facing grant per secret, even
+   * when the model calls the tool twice (the duplicate-grant bug seen in prod).
+   */
+  private inFlight = new Map<string, Promise<AcquiredGrant>>();
 
   constructor(private client: OutrunClient, options: OutrunManagementOptions = {}) {
     this.pollIntervalMs = options.pollIntervalMs ?? 3000;
@@ -77,24 +103,60 @@ export class OutrunManagement implements ManagementProvider {
       }
       allFromCache = false;
 
-      // req.vault disambiguates a lazily-referenced external item when 2+ vaults
-      // are mounted (Outrun mints the reference row under that mount). Harmless
-      // for outrun-stored names, which match before the lazy path runs.
-      const { grantId, status } = await this.client.requestSecretAccess(name, req.reason, req.ttlMinutes, req.vault);
-      const resolved = await this.awaitGrant(grantId, status);
-
-      if (resolved.status !== "active") {
+      try {
+        const { grantId } = await this.grantFor(name, req);
+        perSecret[name] = { grantId };
+      } catch (err) {
         // First failure short-circuits the whole batch — the agent gets one
         // clean denial rather than a partial grant.
-        return { granted: false, denialReason: resolved.status };
+        if (err instanceof GrantNotApprovedError) {
+          return { granted: false, denialReason: err.status };
+        }
+        throw err;
       }
-
-      const exp = parseExpiry(resolved.expiresAt);
-      if (exp !== null) this.grantCache.set(name, { grantId, expiresAt: exp });
-      perSecret[name] = { grantId };
     }
 
     return { granted: true, autoApproved: allFromCache, perSecret };
+  }
+
+  /**
+   * Acquire an active grant for one secret, deduping concurrent requests: while a
+   * request for this name is in flight, additional callers await the SAME promise
+   * rather than opening a second approval. Throws `GrantNotApprovedError` on a
+   * non-active terminal state (denied/revoked/expired/timeout).
+   */
+  private grantFor(name: string, req: AccessRequest): Promise<AcquiredGrant> {
+    const existing = this.inFlight.get(name);
+    if (existing) return existing;
+
+    const promise = this.acquireGrant(name, req);
+    this.inFlight.set(name, promise);
+    // Clear the slot once settled (either outcome) so a later access re-requests.
+    // Guard against clobbering a newer entry for the same name. `then(cb, cb)`
+    // rather than `finally` so this cleanup consumer also handles the rejection —
+    // `finally`'s derived promise would surface a denial/timeout as an unhandled
+    // rejection even though the real caller awaits and handles `promise` itself.
+    const clear = () => {
+      if (this.inFlight.get(name) === promise) this.inFlight.delete(name);
+    };
+    promise.then(clear, clear);
+    return promise;
+  }
+
+  private async acquireGrant(name: string, req: AccessRequest): Promise<AcquiredGrant> {
+    // req.vault disambiguates a lazily-referenced external item when 2+ vaults
+    // are mounted (Outrun mints the reference row under that mount). Harmless
+    // for outrun-stored names, which match before the lazy path runs.
+    const { grantId, status } = await this.client.requestSecretAccess(name, req.reason, req.ttlMinutes, req.vault);
+    const resolved = await this.awaitGrant(grantId, status);
+
+    if (resolved.status !== "active") {
+      throw new GrantNotApprovedError(resolved.status);
+    }
+
+    const exp = parseExpiry(resolved.expiresAt);
+    if (exp !== null) this.grantCache.set(name, { grantId, expiresAt: exp });
+    return { grantId, expiresAt: exp };
   }
 
   async logUse(use: UseLog): Promise<void> {
@@ -116,6 +178,7 @@ export class OutrunManagement implements ManagementProvider {
   /** Drop cached grants — after this every access re-requests approval. */
   async stop(): Promise<void> {
     this.grantCache.clear();
+    this.inFlight.clear();
   }
 
   private cachedGrant(name: string): CachedGrant | null {
