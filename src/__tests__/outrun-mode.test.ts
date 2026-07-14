@@ -440,6 +440,53 @@ test("Outrun list_secrets merges Outrun-stored items, external items, and mounte
   }
 });
 
+test("Outrun list_secrets enumerates a mounted vault's real item titles via the local provider", async () => {
+  const mock = new MockOutrun();
+  mock.secrets = [{ id: "sec-1", name: "OPENAI_KEY", storage: "outrun" }];
+  mock.mounts = [{ toolId: "t1", displayName: "Company 1P", connectionData: { provider: "1password" } }];
+  // The real 1Password item is titled "GitHub" — NOT "GitHub Token"/"github_token".
+  const local = fakeLocalProvider("1password", { GitHub: "ghp_secret", Stripe: "sk_live" }, []);
+  mock.install();
+  try {
+    const client = await connectClient(buildBackend(mock, [local]));
+    const result = await client.callTool({ name: "list_secrets", arguments: {} });
+    const text = textOf(result);
+    // Real titles the agent can request on the first try — no more guessing.
+    assert.match(text, /GitHub/);
+    assert.match(text, /Stripe/);
+    assert.match(text, /Company 1P/);
+    // The opaque "request items by name" placeholder is gone once enumeration works.
+    assert.doesNotMatch(text, /request items from this vault by name/);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("Outrun list_secrets falls back to the '*' placeholder when a mount's provider enumeration throws", async () => {
+  const mock = new MockOutrun();
+  mock.mounts = [{ toolId: "t1", displayName: "Company 1P", connectionData: { provider: "1password" } }];
+  const broken: SecretProvider = {
+    name: "1password",
+    async listSecrets(): Promise<SecretEntry[]> {
+      throw new Error("1Password auth failed");
+    },
+    async getSecret() {
+      throw new Error("unused");
+    },
+  };
+  mock.install();
+  try {
+    const client = await connectClient(buildBackend(mock, [broken]));
+    const result = await client.callTool({ name: "list_secrets", arguments: {} });
+    const text = textOf(result);
+    // The mount is still discoverable even though enumeration failed.
+    assert.match(text, /Company 1P/);
+    assert.match(text, /request items from this vault by name/);
+  } finally {
+    mock.restore();
+  }
+});
+
 test("Outrun mode does not support writes", async () => {
   const mock = new MockOutrun();
   mock.install();

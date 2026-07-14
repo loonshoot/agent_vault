@@ -279,12 +279,44 @@ export class OutrunBackend implements SecretBackend {
       });
     }
 
-    // Always surface the mounts themselves — a mounted vault's items appear
-    // lazily (on first grant), so an agent may need to request an item by name
-    // that isn't enumerated yet.
+    // Surface each mount's real item titles by enumerating through the matching
+    // local provider (hybrid mode — the provider reads names/ids only, never
+    // values). Without this an agent has no way to discover an item's exact
+    // title before requesting it, so it guesses (e.g. "GitHub Token",
+    // "github_token") and every near-miss lazily mints a junk placeholder secret.
+    // Falls back to the "*" placeholder when no local provider matches the mount
+    // or its enumeration fails — one vault's listSecrets error never breaks
+    // list_secrets for the other groups.
     for (const m of mounts) {
+      const group = `${m.displayName} (mounted ${m.connectionData.provider} vault)`;
+      const provider = this.localProviderByType(m.connectionData.provider);
+
+      if (provider) {
+        try {
+          const localItems = await provider.listSecrets();
+          if (localItems.length) {
+            groups.push({
+              group,
+              secrets: localItems.map((i) => ({
+                name: i.name,
+                note: i.group ? `1Password: ${i.group}` : undefined,
+              })),
+            });
+            continue;
+          }
+        } catch (err) {
+          // Enumeration failed (auth, network, etc.) — fall through to the "*"
+          // placeholder so the mount is still discoverable by name.
+          console.warn(
+            `[OutrunBackend.list] listSecrets failed for mount "${m.displayName}" (${m.connectionData.provider}): ${
+              err instanceof Error ? err.message : String(err)
+            }`
+          );
+        }
+      }
+
       groups.push({
-        group: `${m.displayName} (mounted ${m.connectionData.provider} vault)`,
+        group,
         secrets: [{ name: "*", note: "request items from this vault by name" }],
       });
     }
