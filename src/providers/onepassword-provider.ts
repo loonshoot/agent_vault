@@ -22,13 +22,28 @@ export class OnePasswordProvider implements SecretProvider {
    * @param writeConfig - Optional write config specifying which vault and category to create items in.
    */
   constructor(authToken: string, vaultIds: string[] = [], writeConfig?: { vaultId: string; category: string }) {
-    this.authToken = authToken;
+    // Trim surrounding whitespace/quotes that commonly sneak in via shell/env passthrough.
+    this.authToken = (authToken ?? "").trim().replace(/^["']|["']$/g, "");
     this.vaultIds = vaultIds;
     this.writeConfig = writeConfig;
   }
 
   private async getClient() {
     if (this.client) return this.client;
+    // Fail loudly with an actionable message BEFORE handing a bad token to the
+    // 1Password SDK (which only says "service account token had invalid format").
+    // Common causes: the env var was unset so an unexpanded "${OP_SERVICE_ACCOUNT_TOKEN}"
+    // or literal "env:..." string was passed, or the value is empty/wrong type.
+    const t = this.authToken;
+    if (!t || t.startsWith("${") || t.startsWith("env:") || !t.startsWith("ops_")) {
+      const shown = !t ? "<empty>" : `${t.slice(0, 4)}… (len ${t.length})`;
+      throw new Error(
+        `1Password service account token is missing or malformed (got ${shown}). ` +
+        `Set OP_SERVICE_ACCOUNT_TOKEN to a valid service-account token (starts with "ops_") ` +
+        `in the environment the agent-vault server runs in — e.g. export it in your shell or ` +
+        `add it to the config/.env the server loads, then restart. This is NOT an approval denial.`
+      );
+    }
     // Dynamic import — @1password/sdk is an optional dependency
     // @ts-ignore - optional peer dependency
     const { createClient } = await import("@1password/sdk");
