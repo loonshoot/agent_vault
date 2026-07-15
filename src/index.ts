@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { ApprovalServer } from "./approval.js";
-import { AuditLog } from "./audit.js";
+import type { ApprovalServer } from "./approval.js";
+import type { AuditLog } from "./audit.js";
 import { loadConfig } from "./config.js";
 import { createMcpServer, type VaultInstance } from "./server.js";
-import { WebhookDispatcher } from "./webhooks.js";
 import { startHttpTransport } from "./http-transport.js";
 import { EnvFileProvider } from "./providers/env-provider.js";
 import { OnePasswordProvider } from "./providers/onepassword-provider.js";
@@ -15,8 +14,18 @@ import { OutrunClient } from "./outrun/client.js";
 import { OutrunManagement, OutrunBackend } from "./management/outrun-management.js";
 import { LocalManagement, LocalBackend } from "./management/local-management.js";
 import type { SecretBackend } from "./management/management.js";
+import { runFetchCli } from "./fetch-cli.js";
 
 async function main() {
+  // `agent-vault fetch --secret X --reason Y` is a one-shot headless mode,
+  // not the MCP server — handle it before touching any MCP transport/server
+  // setup and exit directly with its result. See fetch-cli.ts for why this
+  // exists (bootstrapping an agent's OWN launch credential from the vault).
+  if (process.argv[2] === "fetch") {
+    const code = await runFetchCli(process.argv.slice(3));
+    process.exit(code);
+  }
+
   const config = loadConfig();
   const cli = parseCliArgs(process.argv.slice(2));
 
@@ -63,10 +72,20 @@ async function main() {
     );
   } else {
     // ── Local mode: the original PoC composition. ──
+    // Dynamic imports, not static top-of-file ones: better-sqlite3 (audit.js)
+    // needs a native build, and Outrun-mode-only deployments (e.g. the
+    // outrun-ai-developer worker container, which only ever uses Outrun mode
+    // and `agent-vault fetch`) shouldn't need a C/C++ toolchain just because
+    // this module happened to be imported — a static `import` is resolved at
+    // module-load time regardless of which branch runs, so it was pulling in
+    // better-sqlite3 even for `agent-vault fetch`'s early-exit path above.
     if (vaults.length === 0) {
       console.error("Error: no vaults configured (and no `outrun` block).");
       process.exit(1);
     }
+    const { AuditLog } = await import("./audit.js");
+    const { ApprovalServer } = await import("./approval.js");
+    const { WebhookDispatcher } = await import("./webhooks.js");
     audit = new AuditLog(dbPath);
     const webhooks = new WebhookDispatcher(config.webhooks);
     // ApprovalServer holds the single shared `pending` map for this process —
