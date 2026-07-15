@@ -96,6 +96,38 @@ That's it. Every project on your machine can use it — no cloning, no per-proje
 
 Agent Vault uses stdio transport by default. Point your client at `npx agent-vault` with the environment variables above.
 
+### Headless bootstrap — `agent-vault fetch` (Outrun mode only)
+
+MCP tools (`get_secret`, etc.) only exist once an MCP client — Claude Code, Cursor,
+whatever — is already running and connected. That's a problem exactly once: when
+the secret an agent needs is the credential that lets IT start in the first place
+(e.g. a `CLAUDE_CODE_OAUTH_TOKEN` an entrypoint script needs before it can even
+launch `claude`). `agent-vault fetch` is a one-shot, non-MCP escape hatch for that
+case — it runs the same request → poll-for-approval → read flow as `get_secret`,
+but as a plain CLI call:
+
+```bash
+TOKEN=$(agent-vault fetch --secret CLAUDE_CODE_OAUTH_TOKEN --reason "Authenticate the worker")
+export CLAUDE_CODE_OAUTH_TOKEN="$TOKEN"
+claude ...
+```
+
+- Requires an `outrun` block in `agent-vault.config.json` (local-vault mode isn't
+  supported here — its approval page assumes a human at a browser, which doesn't
+  fit a one-shot headless call the same way).
+- On success, the raw secret value is the ONLY thing written to stdout — safe to
+  capture directly into a shell variable. Everything else (config-loading notices,
+  denial/timeout messages) goes to stderr.
+- Exits `0` on success, `1` on denial/timeout/misconfiguration.
+- Flags: `--secret <name>` (required), `--reason <text>` (required — shown to the
+  approver and audited), `--vault <name>` (only meaningful in local mode; ignored
+  here), `--requester-id` / `--task-id` / `--branch` (optional attribution, shown
+  to the approver alongside the reason).
+
+Once the agent it bootstraps IS running, register `agent-vault` as a normal MCP
+server (same config) so it can `get_secret` anything else it needs mid-task —
+`fetch` only covers the one bootstrap gap MCP can't.
+
 ### Multi-worker / HTTP transport
 
 By default, Agent Vault runs over **stdio** — one subprocess per client, spawned by your MCP client's config. That's the right model for a single developer with a single agent session.
