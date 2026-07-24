@@ -37,3 +37,14 @@ test("parseFetchArgs: all flags parse", () => {
 test("parseFetchArgs: ignores unrelated args", () => {
   assert.deepEqual(parseFetchArgs(["--some-other-flag", "value"]), {});
 });
+
+test("parseFetchArgs: --grant-id parses (resume fast path)", () => {
+  assert.deepEqual(
+    parseFetchArgs(["--secret", "CLAUDE_CODE_OAUTH_TOKEN", "--reason", "resume", "--grant-id", "66d60541-c3e4-4333-9e55-aeccdbe99ebc"]),
+    {
+      secret: "CLAUDE_CODE_OAUTH_TOKEN",
+      reason: "resume",
+      grantId: "66d60541-c3e4-4333-9e55-aeccdbe99ebc",
+    }
+  );
+});
