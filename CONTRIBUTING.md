@@ -25,9 +25,12 @@ npm run dev
 | File | Purpose |
 |---|---|
 | `src/index.ts` | Entry point — resolves config, starts the approval server and MCP server |
-| `src/server.ts` | MCP tool definitions (`list_secrets`, `get_secret`) |
+| `src/cli-args.ts` | Parses `--http` / `--port` / `--host` flags |
+| `src/server.ts` | MCP tool definitions (`list_secrets`, `get_secret(s)`, `set_secret(s)`) |
 | `src/approval.ts` | Express server + ngrok tunnel for the approve/deny web pages |
+| `src/http-transport.ts` | Streamable HTTP MCP transport, for running one shared process across multiple remote workers |
 | `src/audit.ts` | SQLite audit log and TTL auto-approval logic |
+| `src/webhooks.ts` | Observability webhooks — resolved events plus the "pending" event, JSON and ntfy.sh formats |
 | `src/providers/provider.ts` | `SecretProvider` interface |
 | `src/providers/env-provider.ts` | `.env` file provider |
 | `src/providers/onepassword-provider.ts` | 1Password service account provider |
@@ -63,14 +66,22 @@ interface SecretProvider {
 
 ## Testing
 
-Currently there are no automated tests. If you're adding a provider, test it manually:
+Automated tests live in `src/__tests__/` and run on Node's built-in test runner via `tsx`:
+
+```bash
+npm test
+```
+
+They cover the approval flow (including the multi-worker attribution fields and the "pending" webhook event), the audit log (including backward-compatible schema migration), the HTTP transport, and — critically — a regression test asserting the approval URL / pending-request ID never appears in an MCP tool response returned to the calling agent. If you touch `approval.ts`, `server.ts`, or `webhooks.ts`, make sure that invariant test still passes.
+
+If you're adding a provider, there's no automated coverage for provider implementations yet — test it manually:
 
 1. Start the server with your provider configured
 2. Connect an MCP client (or use the MCP inspector)
 3. Call `list_secrets` and verify the output
 4. Call `get_secret` and verify the approval flow works end-to-end
 
-Automated tests are welcome — especially for the approval flow and audit log.
+Automated provider tests are welcome too.
 
 ## Pull requests
 

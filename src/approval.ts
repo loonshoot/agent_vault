@@ -2,6 +2,7 @@ import express from "express";
 import ngrok from "@ngrok/ngrok";
 import { nanoid } from "nanoid";
 import type { Server } from "node:http";
+import type { WebhookDispatcher } from "./webhooks.js";
 
 export interface ApprovalRequest {
   id: string;
@@ -11,6 +12,12 @@ export interface ApprovalRequest {
   action: "read" | "write";
   /** Masked preview of the value for write requests */
   maskedValue?: string;
+  /** Identity of the requesting worker/agent, if provided (multi-worker attribution) */
+  requesterId?: string;
+  /** Task or job identifier the request was made on behalf of, if provided */
+  taskId?: string;
+  /** Branch or workspace identifier, if provided */
+  branch?: string;
   createdAt: Date;
   resolve: (approved: boolean) => void;
 }
@@ -21,7 +28,15 @@ export class ApprovalServer {
   private publicUrl: string | null = null;
   private pending = new Map<string, ApprovalRequest>();
 
-  constructor(private port: number = 9999) {
+  /**
+   * `webhooks` is optional so ApprovalServer can still be constructed and used
+   * standalone (e.g. in tests) without wiring up the full webhook dispatcher.
+   * When present, a "pending" event fires the instant requestApproval() creates
+   * a request — this is what closes the "nothing tells a human a worker is
+   * blocked right now" gap. Multiple simultaneous requests are already
+   * supported via the `pending` map; this just adds a push signal per request.
+   */
+  constructor(private port: number = 9999, private webhooks?: WebhookDispatcher) {
     this.setupRoutes();
   }
 
@@ -39,6 +54,7 @@ export class ApprovalServer {
             : `<span class="badge read">READ</span>`;
           return `<div class="request-info" style="margin-bottom:16px;padding:12px;border:1px solid #333;border-radius:8px">
             <p>${badge} <strong>${escapeHtml(r.secretName)}</strong></p>
+            <p style="font-size:12px;color:#777">${escapeHtml(formatRequester(r))}</p>
             <p style="font-size:13px;color:#999">${escapeHtml(r.reason)}</p>
             <div class="actions" style="margin-top:8px">
               <form method="POST" action="/approve/${r.id}/yes" style="display:inline">
@@ -73,6 +89,7 @@ export class ApprovalServer {
         actionLabel,
         `<div class="request-info">
           <p>${actionBadge} <strong>Secret:</strong> ${escapeHtml(request.secretName)}</p>
+          <p><strong>${escapeHtml(formatRequester(request))}</strong></p>
           ${maskedLine}
           <p><strong>Reason:</strong> ${escapeHtml(request.reason)}</p>
           <p><strong>Requested:</strong> ${request.createdAt.toLocaleString()}</p>
@@ -157,11 +174,30 @@ export class ApprovalServer {
    * Create an approval request and return the public URL.
    * The returned promise resolves to `true` (approved) or `false` (denied)
    * when the user clicks the link.
+   *
+   * SECURITY INVARIANT: `url` (and the underlying pending-request `id`) must
+   * NEVER be included in an MCP tool response returned to the calling agent —
+   * callers in server.ts only console.error() it and await `waitForApproval`.
+   * This is a structural mitigation against the co-located agent self-approval
+   * attack documented in SECURITY_WHITEPAPER.md §2.2. Do not change that.
+   *
+   * `vault`/`secrets` (structured, for webhook payloads) and `requesterId` /
+   * `taskId` / `branch` (attribution, for display + audit + webhooks) are all
+   * optional — omitting them keeps existing callers working unchanged and
+   * renders as "unknown worker" wherever attribution is shown.
    */
   requestApproval(
     secretName: string,
     reason: string,
-    options?: { action?: "read" | "write"; maskedValue?: string }
+    options?: {
+      action?: "read" | "write";
+      maskedValue?: string;
+      vault?: string;
+      secrets?: string[];
+      requesterId?: string;
+      taskId?: string;
+      branch?: string;
+    }
   ): { url: string; waitForApproval: Promise<boolean> } {
     const id = nanoid(16);
     const url = `${this.publicUrl}/approve/${id}`;
@@ -173,9 +209,33 @@ export class ApprovalServer {
         reason,
         action: options?.action ?? "read",
         maskedValue: options?.maskedValue,
+        requesterId: options?.requesterId,
+        taskId: options?.taskId,
+        branch: options?.branch,
         createdAt: new Date(),
         resolve,
       });
+    });
+
+    // Fire the "pending" webhook event the instant the request is created —
+    // i.e. before any human has acted. This is the only event that can back a
+    // real push notification ("a worker is blocked right now"); approved/
+    // denied/auto_approved only fire after resolution. The approval `url` is
+    // included here deliberately: this event only ever reaches endpoints the
+    // human configured themselves (their own notification channel), the same
+    // out-of-band trust boundary as the console.error'd link. It is never
+    // part of the object returned from this method's `url`/tool-response path
+    // to the agent beyond what already happens today.
+    this.webhooks?.dispatchPending({
+      timestamp: new Date().toISOString(),
+      vault: options?.vault ?? "",
+      secrets: options?.secrets ?? [secretName],
+      reason,
+      action: "pending",
+      requesterId: options?.requesterId,
+      taskId: options?.taskId,
+      branch: options?.branch,
+      approvalUrl: url,
     });
 
     return { url, waitForApproval };
@@ -233,6 +293,19 @@ export class ApprovalServer {
 </body>
 </html>`;
   }
+}
+
+/**
+ * Render a human-readable attribution line, e.g.
+ * "Worker: task-142 / churn-preset requests HUBSPOT_SANDBOX_TOKEN".
+ * Falls back to "Worker: unknown worker" when no identity was provided —
+ * this keeps callers that omit requesterId/taskId/branch working unchanged.
+ */
+export function formatRequester(r: Pick<ApprovalRequest, "taskId" | "requesterId" | "branch" | "secretName">): string {
+  const parts = [r.taskId, r.requesterId].filter(Boolean);
+  const who = parts.length ? parts.join(" / ") : "unknown worker";
+  const branchSuffix = r.branch ? ` (branch: ${r.branch})` : "";
+  return `Worker: ${who} requests ${r.secretName}${branchSuffix}`;
 }
 
 function escapeHtml(str: string): string {

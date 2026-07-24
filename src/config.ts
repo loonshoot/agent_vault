@@ -34,30 +34,91 @@ export interface WebhookConfig {
   url: string;
   /** Optional authorization header value (supports env: references) */
   authorization?: string;
-  /** Which events to send: "all", "approved", "denied", or an array of specific actions */
-  events?: "all" | ("approved" | "denied" | "auto_approved")[];
+  /**
+   * Which events to send: "all", or an array of specific event types.
+   * "pending" fires the instant a request is created (before any human has acted) —
+   * this is the only event type suitable for a "wake up and approve this" push
+   * notification. "approved"/"denied"/"auto_approved" fire after resolution.
+   */
+  events?: "all" | ("pending" | "approved" | "denied" | "auto_approved")[];
+  /**
+   * Payload format. "json" (default) sends the standard structured event body.
+   * "ntfy" sends a plain-text message plus ntfy.sh notification headers
+   * (title/priority/click), so a plain `https://ntfy.sh/<topic>` endpoint renders
+   * a readable push notification instead of a raw JSON blob.
+   */
+  format?: "json" | "ntfy";
+}
+
+/**
+ * Outrun-managed mode. When present, approval / audit / revocation move to
+ * Outrun (no ngrok approval server); per-secret routing decides whether a value
+ * is served by Outrun (`readSecretFields`) or read from a local `vaults`
+ * provider (hybrid, mounted external vault). `apiKey` supports env: indirection
+ * like the rest of the config.
+ */
+export interface OutrunConfig {
+  /** Gateway base URL — requests POST to `${url}/graphql`. */
+  url: string;
+  /** Gateway API key (workspace-scoped, `action:secrets` capability). Supports env: refs. */
+  apiKey: string;
+  /** Workspace the key is scoped to. */
+  workspaceId: string;
+  /** Poll interval (ms) while waiting for a standalone approval (default 3000). */
+  pollIntervalMs?: number;
+  /** Approval wait timeout (ms) before giving up (default 900000 = 15 min). */
+  timeoutMs?: number;
+  /** Default requested TTL (minutes) when the agent doesn't specify one. */
+  defaultTtlMinutes?: number;
 }
 
 export interface AgentVaultConfigFile {
-  vaults: Record<string, VaultConfig>;
+  vaults?: Record<string, VaultConfig>;
+  outrun?: OutrunConfig;
   ngrokAuthToken?: string;
   port?: number;
   /** Webhook endpoints for observability — send access events to logging/analytics */
   webhooks?: WebhookConfig[];
+  /**
+   * MCP transport mode. "stdio" (default) spawns one server per client, matching
+   * the classic `npx agent-vault` per-project usage. "http" runs a single
+   * long-lived process reachable over the network by multiple remote clients,
+   * sharing one pending-approval map, one TTL cache, and one audit log.
+   * Can also be set via AGENT_VAULT_TRANSPORT or the --http CLI flag.
+   */
+  transport?: "stdio" | "http";
+  /** Port for the HTTP MCP transport (default: 8080). Also AGENT_VAULT_HTTP_PORT / --port. */
+  httpPort?: number;
+  /** Host for the HTTP MCP transport (default: 127.0.0.1). Also AGENT_VAULT_HTTP_HOST / --host. */
+  httpHost?: string;
 }
 
 /** Resolved config with env: references replaced by actual values */
 export interface ResolvedConfig {
   vaults: Record<string, ResolvedVaultConfig>;
+  outrun?: ResolvedOutrunConfig;
   ngrokAuthToken?: string;
   port: number;
   webhooks: ResolvedWebhookConfig[];
+  transport: "stdio" | "http";
+  httpPort: number;
+  httpHost: string;
+}
+
+export interface ResolvedOutrunConfig {
+  url: string;
+  apiKey: string;
+  workspaceId: string;
+  pollIntervalMs?: number;
+  timeoutMs?: number;
+  defaultTtlMinutes?: number;
 }
 
 export interface ResolvedWebhookConfig {
   url: string;
   authorization?: string;
-  events: "all" | ("approved" | "denied" | "auto_approved")[];
+  events: "all" | ("pending" | "approved" | "denied" | "auto_approved")[];
+  format: "json" | "ntfy";
 }
 
 export interface ResolvedVaultConfig {
@@ -139,7 +200,7 @@ function parseConfigFile(configPath: string): ResolvedConfig {
 
   const vaults: Record<string, ResolvedVaultConfig> = {};
 
-  for (const [name, vault] of Object.entries(parsed.vaults)) {
+  for (const [name, vault] of Object.entries(parsed.vaults ?? {})) {
     const resolved: ResolvedVaultConfig = {
       type: vault.type,
       ttl: vault.ttl ?? 0,
@@ -172,13 +233,52 @@ function parseConfigFile(configPath: string): ResolvedConfig {
     url: wh.url,
     authorization: resolveEnvRef(wh.authorization),
     events: wh.events ?? "all",
+    format: wh.format ?? "json",
   }));
+
+  // Transport resolution precedence: env var > config file > default.
+  // (The --http / --port / --host CLI flags take precedence over all of this;
+  // that's applied on top of the resolved config in index.ts.)
+  const envTransport = process.env.AGENT_VAULT_TRANSPORT;
+  const transport: "stdio" | "http" =
+    envTransport === "http" || envTransport === "stdio"
+      ? envTransport
+      : parsed.transport ?? "stdio";
+
+  const httpPort = process.env.AGENT_VAULT_HTTP_PORT
+    ? Number(process.env.AGENT_VAULT_HTTP_PORT)
+    : parsed.httpPort ?? 8080;
+
+  const httpHost = process.env.AGENT_VAULT_HTTP_HOST || parsed.httpHost || "127.0.0.1";
+
+  let outrun: ResolvedOutrunConfig | undefined;
+  if (parsed.outrun) {
+    const apiKey = resolveEnvRef(parsed.outrun.apiKey);
+    if (!apiKey) {
+      console.error(
+        `Error: "outrun" block is configured but its apiKey could not be resolved (check the env var it references).`
+      );
+      process.exit(1);
+    }
+    outrun = {
+      url: parsed.outrun.url,
+      apiKey,
+      workspaceId: parsed.outrun.workspaceId,
+      pollIntervalMs: parsed.outrun.pollIntervalMs,
+      timeoutMs: parsed.outrun.timeoutMs,
+      defaultTtlMinutes: parsed.outrun.defaultTtlMinutes,
+    };
+  }
 
   return {
     vaults,
+    outrun,
     ngrokAuthToken: resolveEnvRef(parsed.ngrokAuthToken),
     port: parsed.port ?? 9999,
     webhooks,
+    transport,
+    httpPort,
+    httpHost,
   };
 }
 

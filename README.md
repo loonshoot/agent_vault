@@ -94,7 +94,78 @@ That's it. Every project on your machine can use it — no cloning, no per-proje
 
 ### Add to Cursor / other MCP clients
 
-Agent Vault uses stdio transport. Point your client at `npx agent-vault` with the environment variables above.
+Agent Vault uses stdio transport by default. Point your client at `npx agent-vault` with the environment variables above.
+
+### Headless bootstrap — `agent-vault fetch` (Outrun mode only)
+
+MCP tools (`get_secret`, etc.) only exist once an MCP client — Claude Code, Cursor,
+whatever — is already running and connected. That's a problem exactly once: when
+the secret an agent needs is the credential that lets IT start in the first place
+(e.g. a `CLAUDE_CODE_OAUTH_TOKEN` an entrypoint script needs before it can even
+launch `claude`). `agent-vault fetch` is a one-shot, non-MCP escape hatch for that
+case — it runs the same request → poll-for-approval → read flow as `get_secret`,
+but as a plain CLI call:
+
+```bash
+TOKEN=$(agent-vault fetch --secret CLAUDE_CODE_OAUTH_TOKEN --reason "Authenticate the worker")
+export CLAUDE_CODE_OAUTH_TOKEN="$TOKEN"
+claude ...
+```
+
+- Requires an `outrun` block in `agent-vault.config.json` (local-vault mode isn't
+  supported here — its approval page assumes a human at a browser, which doesn't
+  fit a one-shot headless call the same way).
+- On success, the raw secret value is the ONLY thing written to stdout — safe to
+  capture directly into a shell variable. Everything else (config-loading notices,
+  denial/timeout messages) goes to stderr.
+- Exits `0` on success, `1` on denial/timeout/misconfiguration.
+- Flags: `--secret <name>` (required), `--reason <text>` (required — shown to the
+  approver and audited), `--vault <name>` (only meaningful in local mode; ignored
+  here), `--requester-id` / `--task-id` / `--branch` (optional attribution, shown
+  to the approver alongside the reason).
+
+Once the agent it bootstraps IS running, register `agent-vault` as a normal MCP
+server (same config) so it can `get_secret` anything else it needs mid-task —
+`fetch` only covers the one bootstrap gap MCP can't.
+
+### Multi-worker / HTTP transport
+
+By default, Agent Vault runs over **stdio** — one subprocess per client, spawned by your MCP client's config. That's the right model for a single developer with a single agent session.
+
+If you're running **multiple agents/workers against the same vault config** (e.g. several headless Claude Code sessions, or a CI fleet), stdio means each one spawns its own isolated subprocess — its own `pending` approval map, its own TTL cache, its own audit log. You'd get pinged separately per worker even for the same vault, and TTL windows wouldn't be shared.
+
+`--http` runs Agent Vault as **one long-lived process** that multiple remote clients connect to over the network, sharing a single pending-approval map, TTL cache, and audit log:
+
+```bash
+# stdio (default) — unchanged
+npx agent-vault
+
+# HTTP transport — one shared process on port 8080
+npx agent-vault --http
+npx agent-vault --http --port 8080 --host 0.0.0.0
+```
+
+Equivalent env vars / config file fields (useful when you don't control the invocation, e.g. a systemd unit or Docker `CMD`):
+
+```bash
+AGENT_VAULT_TRANSPORT=http
+AGENT_VAULT_HTTP_PORT=8080
+AGENT_VAULT_HTTP_HOST=0.0.0.0   # default: 127.0.0.1
+```
+
+```json
+{
+  "transport": "http",
+  "httpPort": 8080,
+  "httpHost": "0.0.0.0"
+}
+```
+
+Precedence: `--http`/`--port`/`--host` CLI flags > `AGENT_VAULT_TRANSPORT`/`AGENT_VAULT_HTTP_PORT`/`AGENT_VAULT_HTTP_HOST` env vars > `transport`/`httpPort`/`httpHost` in the config file > default (`stdio`).
+
+Point MCP clients at the resulting endpoint (`http://<host>:<port>/mcp`) using their HTTP/Streamable-HTTP transport option instead of `command`/`args`.
+
+**Note on binding to `0.0.0.0`:** this exposes the MCP endpoint to your network, not just localhost. Combine it with a firewall, VPN, or reverse-proxy auth — the approval server's own auth gaps (see [Security considerations](#security-considerations)) apply equally here.
 
 ## Usage examples
 
@@ -378,6 +449,11 @@ Requests access to a single secret. Use `get_secrets` (below) when you need mult
 | `vault` | string | The vault name (as defined in your config) |
 | `name` | string | The name or ID of the secret |
 | `reason` | string | Why the agent needs this secret (shown to the approver) |
+| `requesterId` | string (optional) | Identity of the requesting worker/agent — shown to the approver for attribution when running multiple workers (e.g. against the [HTTP transport](#multi-worker--http-transport)) |
+| `taskId` | string (optional) | Task/job identifier this request is on behalf of |
+| `branch` | string (optional) | Branch or workspace identifier |
+
+All three are optional and backward compatible — omitting them displays as "unknown worker" on the approval page and in the audit log; existing callers need no changes. `get_secrets`, `set_secret`, and `set_secrets` accept the same three optional parameters.
 
 The tool call **blocks** until you approve or deny. The agent cannot proceed without your decision.
 
@@ -595,7 +671,8 @@ Add a `webhooks` array to your config:
 |---|---|---|---|
 | `url` | string | *required* | Endpoint to POST events to |
 | `authorization` | string | — | `Authorization` header value (supports `env:` references) |
-| `events` | `"all"` or array | `"all"` | Which events to send: `"approved"`, `"denied"`, `"auto_approved"` |
+| `events` | `"all"` or array | `"all"` | Which events to send: `"pending"`, `"approved"`, `"denied"`, `"auto_approved"` |
+| `format` | `"json"` or `"ntfy"` | `"json"` | `"json"` sends the structured event body below. `"ntfy"` sends a human-readable plain-text message plus [ntfy.sh](https://ntfy.sh) notification headers — see [Push notifications with ntfy.sh](#push-notifications-with-ntfysh) |
 
 ### Event payload
 
@@ -610,20 +687,61 @@ Every event is a JSON POST with this shape:
   "reason": "Need database credentials to run migration 0042",
   "action": "approved",
   "scope": "vault",
-  "ttlExpiresAt": "2026-04-10T14:47:01.000Z"
+  "ttlExpiresAt": "2026-04-10T14:47:01.000Z",
+  "requesterId": "churn-preset",
+  "taskId": "task-142"
 }
 ```
 
 | Field | Description |
 |---|---|
-| `event` | Always `"secret_access"` |
-| `timestamp` | ISO 8601 when the decision was made |
+| `event` | `"secret_access"` for resolved requests, `"secret_pending"` for pending requests (see below) |
+| `timestamp` | ISO 8601 when the event fired |
 | `vault` | Which vault was accessed |
 | `secrets` | Array of secret names in the request |
 | `reason` | The agent's stated reason |
-| `action` | `"approved"`, `"denied"`, or `"auto_approved"` |
-| `scope` | `"secret"` or `"vault"` — what the approval covered |
-| `ttlExpiresAt` | When the approval window expires (null if no TTL) |
+| `action` | `"pending"`, `"approved"`, `"denied"`, or `"auto_approved"` |
+| `scope` | `"secret"` or `"vault"` — what the approval covered (resolved events only) |
+| `ttlExpiresAt` | When the approval window expires (null if no TTL, resolved events only) |
+| `requesterId` / `taskId` / `branch` | Attribution fields, if the calling agent supplied them (optional) |
+
+### The "pending" event — know the instant a worker is blocked
+
+`approved`/`denied`/`auto_approved` all fire **after** a human (or the TTL cache) has already resolved the request — nothing tells you a worker is sitting there blocked *right now*. The `pending` event closes that gap: it fires the instant `get_secret`/`get_secrets`/`set_secret`/`set_secrets` creates a new approval request, before anyone has acted on it.
+
+```json
+{
+  "event": "secret_pending",
+  "timestamp": "2026-04-10T14:32:00.000Z",
+  "vault": "prod",
+  "secrets": ["DATABASE_URL"],
+  "reason": "Run migration 0042",
+  "action": "pending",
+  "requesterId": "churn-preset",
+  "taskId": "task-142",
+  "approvalUrl": "https://abc123.ngrok-free.app/approve/xK9mQ2..."
+}
+```
+
+The `approvalUrl` is included deliberately — this event only ever reaches an endpoint *you* configured (your own logging/notification channel), which is the same out-of-band trust boundary that already delivers the link via the terminal. **It is never included in the MCP tool response returned to the calling agent** — that response only ever contains the approve/deny outcome, never the URL or the pending-request ID (this is the same structural mitigation against co-located agent self-approval described in the [Security Whitepaper](SECURITY_WHITEPAPER.md#22-co-located-agent-self-approval)).
+
+### Push notifications with ntfy.sh
+
+[ntfy.sh](https://ntfy.sh) is a free, zero-signup push notification service — pick a random topic name, subscribe to it in the ntfy app (iOS/Android/web), and POSTs to `https://ntfy.sh/<topic>` show up as a phone notification within seconds. It's the fastest way to get "a worker needs your approval" pushed to your phone without standing up any infrastructure.
+
+```json
+{
+  "webhooks": [
+    {
+      "url": "https://ntfy.sh/agent-vault-<pick-something-random-and-unguessable>",
+      "format": "ntfy",
+      "events": ["pending"]
+    }
+  ]
+}
+```
+
+Subscribe to the same topic in the ntfy app (or `https://ntfy.sh/<topic>` in a browser) and you'll get a push the moment any worker blocks on a secret — title "Agent Vault: approval needed", body showing the worker/task attribution and reason, tap-to-open pointed straight at the approval link. Use a long random topic name (ntfy topics are public-by-obscurity, same trust model as the approval URL itself) or self-host ntfy for anything sensitive.
 
 ### Example integrations
 
@@ -654,6 +772,86 @@ Every event is a JSON POST with this shape:
 ```
 
 Sending only `"denied"` events to Slack is a useful pattern — you get alerted when an agent is denied access, which may indicate something unexpected is happening.
+
+## Outrun-managed mode
+
+Agent Vault splits into two **independently pluggable** hooks:
+
+- **Secrets hook** (`SecretProvider`) — *where a value lives* (1Password, env file, or Outrun).
+- **Management hook** (`ManagementProvider`) — *who approves, audits, and revokes* access.
+
+By default both are **local**: the ngrok approval page decides, and a local SQLite file is the audit trail. Pointing the **management** hook at [Outrun](https://github.com/loonshoot/outrun) moves approval, audit, and revocation off your machine — closing the [co-located self-approval gap](SECURITY_WHITEPAPER.md#22-co-located-agent-self-approval) (the approval surface no longer lives on the agent's host) and making the audit trail server-side and tamper-resistant.
+
+Add an `outrun` block to enable it. `apiKey` is a workspace-scoped gateway API key (with the `action:secrets` capability) and supports `env:` indirection like everything else:
+
+```json
+{
+  "outrun": {
+    "url": "https://your-outrun-gateway.example.com",
+    "apiKey": "env:OUTRUN_API_KEY",
+    "workspaceId": "your-workspace-id",
+    "pollIntervalMs": 3000,
+    "timeoutMs": 900000,
+    "defaultTtlMinutes": 30
+  }
+}
+```
+
+There is **no ngrok/approval server** in Outrun mode. `get_secret` still **blocks** — the SDK requests a grant, then polls Outrun until you approve from anywhere (phone, email reply, Loops, Action Centre) or the request times out. An unexpired grant is reused from an in-process cache without a fresh approval, exactly like a local TTL window.
+
+### Three compositions
+
+| secrets | management | mode | what it means |
+|---|---|---|---|
+| 1Password / env | local | **local PoC** | today's default — nothing changes |
+| 1Password / env | outrun | **hybrid** | your existing vault is *mounted* in Outrun; values never leave it. Outrun runs the HITL approval, audit, and revocation; the SDK checks the grant and logs the use (with purpose) through Outrun *before* reading the value locally. Bring your old secrets with zero uploads. |
+| outrun | outrun | **full-remote** | the value is stored in and served by Outrun (AES-256-GCM at rest); server-enforced end to end. |
+
+**Hybrid** keeps a local `vaults` block — those providers become the local readers for mounted-external secrets:
+
+```json
+{
+  "vaults": {
+    "company-1p": {
+      "type": "1password",
+      "serviceAccountToken": "env:OP_SERVICE_ACCOUNT_TOKEN"
+    }
+  },
+  "outrun": {
+    "url": "https://your-outrun-gateway.example.com",
+    "apiKey": "env:OUTRUN_API_KEY",
+    "workspaceId": "your-workspace-id"
+  }
+}
+```
+
+**Full-remote** needs no `vaults` block at all — Outrun holds every value.
+
+### Per-secret routing (mixed migration)
+
+Hybrid vs full-remote is **not a config switch** — the SDK routes **per secret** off the metadata Outrun returns: a `storage: 'outrun'` item is fetched via `readSecretFields`; a `storage: 'external'` item is read from the local provider matching its mounted vault. One session serves both kinds at once, so you can migrate gradually: mount your 1Password vault today, then rotate individual secrets into Outrun over time. Flipping a secret from external to Outrun-stored needs **no SDK, config, or workflow change** — the secret's name is the stable identifier.
+
+Writes (`set_secret`/`set_secrets`) are not available in Outrun mode — create and rotate credentials in the Outrun UI.
+
+### Claude Code quickstart (Outrun mode)
+
+```json
+{
+  "mcpServers": {
+    "agent-vault": {
+      "command": "npx",
+      "args": ["agent-vault"],
+      "env": {
+        "AGENT_VAULT_CONFIG": "/absolute/path/to/agent-vault.config.json",
+        "OUTRUN_API_KEY": "your_workspace_gateway_key",
+        "OP_SERVICE_ACCOUNT_TOKEN": "your_1password_token"
+      }
+    }
+  }
+}
+```
+
+(`OP_SERVICE_ACCOUNT_TOKEN` is only needed for hybrid mode, to read mounted-external values locally.) The agent-facing tool contract — `list_secrets`, `get_secret{name, reason}` — is identical across all three compositions; only `vault` becomes optional (ignored) in Outrun mode.
 
 ## Security considerations
 
@@ -703,9 +901,12 @@ The interface is intentionally minimal — three members, no lifecycle methods, 
 ```
 src/
 ├── index.ts                  Entry point — wires provider, approval server, and MCP server
-├── server.ts                 MCP server with list_secrets and get_secret tools
-├── approval.ts               Express HTTP server + ngrok tunnel for approve/deny pages
-├── audit.ts                  SQLite audit log with TTL-based auto-approval checks
+├── cli-args.ts                Parses --http / --port / --host flags
+├── server.ts                  MCP server with list_secrets, get_secret(s), set_secret(s) tools
+├── approval.ts                Express HTTP server + ngrok tunnel for approve/deny pages
+├── http-transport.ts           Streamable HTTP MCP transport (multi-worker mode)
+├── audit.ts                   SQLite audit log with TTL-based auto-approval checks
+├── webhooks.ts                 Observability webhooks, incl. the "pending" event + ntfy.sh format
 └── providers/
     ├── provider.ts           SecretProvider interface
     ├── env-provider.ts       .env file provider
@@ -914,7 +1115,8 @@ For the full threat model and hardening roadmap, see the [Security Whitepaper](S
 - [ ] HashiCorp Vault provider
 - [ ] AWS Secrets Manager provider
 - [ ] Secret classification levels (auto-approve low-risk, always prompt for high-risk)
-- [ ] Multiple approval channels (Telegram, Slack, ntfy.sh) as alternatives to the link
+- [x] ntfy.sh push notifications on the "pending" webhook event (see [Push notifications with ntfy.sh](#push-notifications-with-ntfysh))
+- [ ] Additional approval channels (Telegram, Slack) as alternatives to the link
 - [ ] Bulk approval ("approve all secrets for this session")
 - [ ] Web dashboard for audit log
 

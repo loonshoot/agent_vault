@@ -18,7 +18,8 @@
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "tsx --test src/__tests__/*.test.ts"
   },
   "keywords": [
     "mcp",
@@ -49,10 +50,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@ngrok/ngrok": "^1.7.0",
-    "better-sqlite3": "^12.8.0",
     "express": "^5.2.1",
     "nanoid": "^5.1.7"
+  },
+  "optionalDependencies": {
+    "@ngrok/ngrok": "^1.7.0",
+    "better-sqlite3": "^12.8.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
